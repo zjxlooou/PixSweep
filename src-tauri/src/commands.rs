@@ -1018,6 +1018,56 @@ fn score_groups_with_ai(
         }
     }
 
+    // 非人像美学融合：场景判定完成后，对非人像的新评图用 HyperIQA 与 TOPIQ-IAA
+    // 做 50/50 融合——hyperiqa 对风景/宠物/食物的降级敏感度更强（357 张基准
+    // Cohen's d=1.20），但人像偏置重，故人像不启用。融合值重写回评分缓存。
+    if engine.has_hyperiqa() && engine.has_topiq_iia() {
+        let targets: Vec<usize> = need_infer
+            .iter()
+            .copied()
+            .filter(|&i| scenes[i] != crate::ai::scene::Scene::Portrait)
+            .collect();
+        if !targets.is_empty() {
+            const CHUNK: usize = 16;
+            let fuse_start = std::time::Instant::now();
+            emit(ScanPhase::Quality, 0, targets.len(), None, "美学融合");
+            let mut done = 0usize;
+            for chunk in targets.chunks(CHUNK) {
+                let cpaths: Vec<String> = chunk.iter().map(|&i| infos[i].path.clone()).collect();
+                match crate::ai::preprocess::images_to_batch_raw01_512(&cpaths) {
+                    Ok(batch) => match engine.hyperiqa_scores(&batch) {
+                        Ok(hs) => {
+                            for (k, &idx) in chunk.iter().enumerate() {
+                                let Some(h) = hs.get(k).copied() else { continue };
+                                let Some(iaa) = cached_aes[idx] else { continue };
+                                let mapped = crate::ai::engine::HYPERIQA_CAL_A * h
+                                    + crate::ai::engine::HYPERIQA_CAL_B;
+                                let fused = (crate::ai::engine::HYPERIQA_FUSION_WEIGHT * iaa
+                                    + (1.0 - crate::ai::engine::HYPERIQA_FUSION_WEIGHT) * mapped)
+                                    .clamp(1.0, 10.0);
+                                cached_aes[idx] = Some(fused);
+                            }
+                        }
+                        Err(e) => log::warn!("[AI 评分] HyperIQA 推理失败: {}", e),
+                    },
+                    Err(e) => log::warn!("[AI 评分] HyperIQA 预处理失败: {}", e),
+                }
+                done += chunk.len();
+                emit(ScanPhase::Quality, done, targets.len(), None, "美学融合");
+            }
+            // 融合后的美学分重写回缓存（save_ai_scores 仅覆盖 Some 字段）
+            for &idx in &targets {
+                let _ =
+                    db.save_ai_scores(&infos[idx].file_hash, cached_aes[idx], cached_tech[idx]);
+            }
+            log::info!(
+                "[AI 评分] HyperIQA 非人像美学融合: {} 张, 耗时 {:.1}s",
+                targets.len(),
+                fuse_start.elapsed().as_secs_f64()
+            );
+        }
+    }
+
     // 综合评分：用缓存/推理结果 + 启发式（权重依赖尺寸，与哈希缓存一致）
     let cached_aes_arr = cached_aes;
     let cached_tech_arr = cached_tech;

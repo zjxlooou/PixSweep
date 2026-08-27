@@ -101,6 +101,7 @@ if (Test-Path $modelDir) {
         "topiq_nr.onnx",              # TOPIQ_NR_MODEL：主技术质量评分图结构（ResNet50，KonIQ-10k，动态 batch 单文件）
         "topiq_iaa_res50.onnx",       # TOPIQ_IAA_MODEL：主美学评分（ResNet50，AVA，动态 batch 单文件）
         "nima-technical.onnx",        # NIMA_TECH_MODEL：技术评分二级后备
+        "hyperiqa.onnx",              # HYPERIQA_MODEL：非人像美学融合第二意见（FP16 单文件，可选）
         "topiq_nr_face.onnx",         # TOPIQ_NR_FACE_MODEL：人脸专评（有人脸档最高权重）
         "topiq_nr_face.onnx.data"     # TOPIQ_NR_FACE_MODEL 外部权重（与 .onnx 配对）
     )

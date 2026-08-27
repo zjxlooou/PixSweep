@@ -114,3 +114,50 @@ pub fn images_to_batch_nima(paths: &[String]) -> anyhow::Result<Array<f32, Ix4>>
 pub fn images_to_batch_topiq(paths: &[String]) -> anyhow::Result<Array<f32, Ix4>> {
     images_to_batch_layout(paths, TOPIQ_INPUT_SIZE, true, &MEAN_MOBILENET, &STD_MOBILENET)
 }
+
+/// HyperIQA 所需的 `[N, 3, 512, 512]` CHW 批量 tensor。
+///
+/// 导出图内含归一化，外层只做 [0,1] 缩放（2026-08-27 已用 pyiqa 参考分数校准）。
+pub const HYPERIQA_INPUT_SIZE: u32 = 512;
+
+pub fn images_to_batch_raw01_512(paths: &[String]) -> anyhow::Result<Array<f32, Ix4>> {
+    // 无 mean/std 归一化：传恒等参数（0 除 1）
+    images_to_batch_layout(
+        paths,
+        HYPERIQA_INPUT_SIZE,
+        true,
+        &[0.0, 0.0, 0.0],
+        &[1.0, 1.0, 1.0],
+    )
+}
+
+/// 把对齐后的人脸 crop（正方形 RGB buffer）批量转为 TOPIQ-NR 的 `[K,3,384,384]` tensor。
+///
+/// 用于人像融合的 nr-on-face 信号：与整图技术分同一模型/预处理，仅输入源为对齐 crop。
+pub fn face_crops_to_batch_topiq(crops: &[(Vec<u8>, u32)]) -> anyhow::Result<Array<f32, Ix4>> {
+    let k = crops.len();
+    let s = TOPIQ_INPUT_SIZE as usize;
+    let mut batch = Array::zeros((k, 3, s, s));
+    for (i, (rgb, side)) in crops.iter().enumerate() {
+        let img = image::RgbImage::from_raw(*side, *side, rgb.clone())
+            .ok_or_else(|| anyhow::anyhow!("crop 尺寸不匹配 {side}"))?;
+        let resized = image::imageops::resize(
+            &img,
+            TOPIQ_INPUT_SIZE,
+            TOPIQ_INPUT_SIZE,
+            image::imageops::FilterType::Triangle,
+        );
+        for (x, y, px) in resized.enumerate_pixels() {
+            let (xu, yu) = (x as usize, y as usize);
+            let (r, g, b) = (
+                px[0] as f32 / 255.0,
+                px[1] as f32 / 255.0,
+                px[2] as f32 / 255.0,
+            );
+            batch[[i, 0, yu, xu]] = (r - MEAN_MOBILENET[0]) / STD_MOBILENET[0];
+            batch[[i, 1, yu, xu]] = (g - MEAN_MOBILENET[1]) / STD_MOBILENET[1];
+            batch[[i, 2, yu, xu]] = (b - MEAN_MOBILENET[2]) / STD_MOBILENET[2];
+        }
+    }
+    Ok(batch)
+}

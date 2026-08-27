@@ -19,7 +19,8 @@ pub type SharedStore = Arc<parking_lot::Mutex<Store>>;
 /// - v3：聚合由 `min` 改为 `max(open_l, open_r)`（阶段三：单眼 ROI 采到皮肤/眼镜致 0.00
 ///       不再压垮整张睁眼花，只有双眼都判闭才降权），旧 v2 缓存失效。
 /// - v4：新增 `focus_score`（对焦分，增量重扫不再重算对焦），旧 v3 缓存失效。
-pub const AI_FACE_CACHE_SCHEMA: u32 = 4;
+/// - v5：face_score 融合 nr-on-face 第二意见（50/50，修暗光盲区），旧 v4 缓存失效。
+pub const AI_FACE_CACHE_SCHEMA: u32 = 5;
 
 /// 单张图片的人脸/场景/闭眼 AI 结果缓存（阶段一新增，阶段二升级闭眼语义）。
 ///
@@ -70,17 +71,28 @@ pub struct ImageRecord {
     /// `#[serde(default)]` 保证旧版缓存（无此字段）能正常读取。
     #[serde(default)]
     pub ahash: u64,
-    /// CLIP 美学分缓存（0-10 分制），`#[serde(default)]` 兼容旧缓存。
+    /// 美学分缓存（0-10 分制），`#[serde(default)]` 兼容旧缓存。
+    /// 语义受 [`Self::ai_scores_schema`] 保护：不匹配即按未缓存处理。
     #[serde(default)]
     pub aesthetic_score: Option<f32>,
     /// NIMA 技术分缓存（0-10 分制）。
     #[serde(default)]
     pub technical_score: Option<f32>,
+    /// 美学/技术分语义版本。v1（缺字段=旧版）为纯 iaa/nr；v2（2026-08-27）起
+    /// 非人像美学为 hyperiqa 50/50 融合。不匹配 → 按未缓存处理重算一次。
+    #[serde(default)]
+    pub ai_scores_schema: u32,
     /// 人脸/场景/闭眼结果缓存（阶段一：增量扫描复用）。
     /// `#[serde(default)]` 兼容旧缓存（读为 None → 按未缓存处理重算）。
     #[serde(default)]
     pub ai_face_cache: Option<AiFaceCache>,
 }
+
+/// 美学/技术分缓存的当前语义版本。
+///
+/// - v1：字段缺失（旧版）= 纯 TOPIQ-IAA / TOPIQ-NR。
+/// - v2（2026-08-27）：非人像美学 = TOPIQ-IAA ⊕ HyperIQA 50/50 融合。
+pub const AI_SCORES_CACHE_SCHEMA: u32 = 2;
 
 /// 缓存文件内容。
 #[derive(Debug, Default, Serialize, Deserialize)]
@@ -145,6 +157,8 @@ impl Store {
                 ahash,
                 aesthetic_score: prev.as_ref().and_then(|r| r.aesthetic_score),
                 technical_score: prev.as_ref().and_then(|r| r.technical_score),
+                // 保留旧语义版本：旧 v1 记录保持失效状态，由 save_ai_scores 重算后升级
+                ai_scores_schema: prev.as_ref().map(|r| r.ai_scores_schema).unwrap_or(0),
                 ai_face_cache: prev.as_ref().and_then(|r| r.ai_face_cache),
             },
         );
@@ -201,15 +215,19 @@ impl Store {
             if let Some(t) = technical {
                 r.technical_score = Some(t);
             }
+            r.ai_scores_schema = AI_SCORES_CACHE_SCHEMA;
         }
         Ok(())
     }
 
     /// 查询 AI 双维度评分缓存（美学 + 技术）。
-    /// 返回 `Some((aesthetic, technical))`，任一缺失则为 `None`（需重算）。
+    /// 返回 `Some((aesthetic, technical))`，任一缺失或语义版本不符则为 `None`（需重算）。
     pub fn get_cached_ai_scores(&self, file_hash: &str) -> Option<(f32, f32)> {
         let guard = self.inner.lock();
         let r = guard.records.get(file_hash)?;
+        if r.ai_scores_schema != AI_SCORES_CACHE_SCHEMA {
+            return None; // 旧语义缓存（如未融合 hyperiqa 的美学分）一次性失效
+        }
         match (r.aesthetic_score, r.technical_score) {
             (Some(a), Some(t)) => Some((a, t)),
             _ => None,

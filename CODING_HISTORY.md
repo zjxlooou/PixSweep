@@ -216,6 +216,27 @@ Wikimedia Commons 4 类（人像/狗/风景/食物）× 合成降级（blur/jpeg
 
 ---
 
+### 2026-08-27（晚·二）— 落地人像/非人像双融合（目标 3+4）
+
+**需求**：用户拍板把研究中两项融合建议落地。
+
+- **人像质量融合（目标 3）**：`face = nr_face ⊕ nr-on-face 50/50`——TOPIQ-NR 直接对
+  对齐 512 crop（缩到 384）打技术分，与 nr_face 加权。标定依据：nr_face 的暗光盲区
+  （dark45 敏感 -0.038）在 w=0.5 归零、平均降级敏感 ×3.6（+0.010→+0.036），
+  保留一半人脸特化信号。`AI_FACE_CACHE_SCHEMA` 4→5。
+- **非人像美学融合（目标 4）**：场景≠人像时 `美学 = IAA ⊕ HyperIQA 50/50`
+  （hyperiqa_fp16 55MB 单文件 `models/hyperiqa.onnx`，512² raw [0,1] 输入，
+  线性校准 `3.2251*h+3.2467` 对齐 IAA 值域后融合）。commands 在场景判定后新增
+  融合段并重写回缓存。`AI_SCORES_CACHE_SCHEMA` 新增（v2），旧美学缓存一次性失效。
+- 新增 `preprocess::images_to_batch_raw01_512 / face_crops_to_batch_topiq`、
+  `engine.has_hyperiqa / hyperiqa_scores`、常量 `FACE_FUSION_NR_FACE_WEIGHT /
+  HYPERIQA_CAL_A/B / HYPERIQA_FUSION_WEIGHT`。
+
+**回归**：cargo test 39 ✓、tsc/前端 ✓、verify_labeled 6/7 保持（四组正确裕度健康，
+组4 已知不可解不变）。综合分整体小幅上移（人像融合把部分被误压的人像分修正）。
+
+---
+
 ## 评分模型演进（重要）
 
 | 阶段 | 技术评分 | 美学评分 | 时间 |

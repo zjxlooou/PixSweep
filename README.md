@@ -104,7 +104,7 @@ cd PixSweep && bash scripts/test_e2e.sh # 8 阶段全 PASS
 
 完整测试指南见 [`docs/TESTING.md`](./TESTING.md)。
 
-压缩说明：优先使用项目自带 7-Zip（`.tools/7zip/7za.exe`）`-tzip -mx=9` 最大压缩；仅打包代码引用的模型（FP16 精度，共 5 个通用评分文件：`topiq_nr.onnx`（技术主评分）/ `topiq_iaa_res50.onnx`（美学主评分）/ `nima-technical.onnx`（二级后备）/ `topiq_nr_face.onnx` + `topiq_nr_face.onnx.data`（人脸专评，配对文件），另有 `scene/`、`eye/`、`insightface/` 子目录模型），未引用的模型自动跳过。
+压缩说明：优先使用项目自带 7-Zip（`.tools/7zip/7za.exe`）`-tzip -mx=9` 最大压缩；仅打包代码引用的模型（FP16 精度，共 6 个通用评分文件：`topiq_nr.onnx`（技术主评分）/ `topiq_iaa_res50.onnx`（美学主评分）/ `nima-technical.onnx`（二级后备）/ `hyperiqa.onnx`（非人像美学融合）/ `topiq_nr_face.onnx` + `topiq_nr_face.onnx.data`（人脸专评，配对文件），另有 `scene/`、`eye/`、`insightface/` 子目录模型），未引用的模型自动跳过。
 
 ---
 

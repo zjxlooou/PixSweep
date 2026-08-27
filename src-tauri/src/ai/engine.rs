@@ -26,6 +26,22 @@ use ort::session::Session;
 pub const NIMA_TECH_MODEL: &str = "nima-technical.onnx";
 /// TOPIQ-NR 技术质量模型文件名（ResNet50，KonIQ-10k，输出 0~1）。
 pub const TOPIQ_NR_MODEL: &str = "topiq_nr.onnx";
+/// HyperIQA 通用质量模型文件名（ResNet50，KonIQ-10k，FP16 单文件，可选）。
+/// 仅用于**非人像**场景与 TOPIQ-IAA 融合（人像偏置重，人像不启用）。
+pub const HYPERIQA_MODEL: &str = "hyperiqa.onnx";
+
+/// 人像融合权重：`face = w * nr_face + (1-w) * nr_on_face`。
+///
+/// w=0.5 由 357 张基准标定（2026-08-27）：把 nr_face 的暗光盲区
+/// （欠曝人像反而高分，融合前 dark45 敏感 -0.038）归零，
+/// 平均降级敏感度 ×3.6（+0.010 → +0.036），同时保留一半人脸特化信号。
+pub const FACE_FUSION_NR_FACE_WEIGHT: f32 = 0.5;
+
+/// HyperIQA → TOPIQ-IAA 尺度的线性校准（2026-08-27，357 张基准最小二乘）。
+/// 映射 `iaa_est = A*h + B`（h 为 [0,1] 原始输出），与 IAA 值域对齐后做 0.5/0.5 融合。
+pub const HYPERIQA_CAL_A: f32 = 3.2251;
+pub const HYPERIQA_CAL_B: f32 = 3.2467;
+pub const HYPERIQA_FUSION_WEIGHT: f32 = 0.5;
 /// TOPIQ-IAA 美学模型文件名（ResNet50，AVA，输出 10-bin softmax）。
 pub const TOPIQ_IAA_MODEL: &str = "topiq_iaa_res50.onnx";
 
@@ -82,6 +98,8 @@ pub struct AiEngine {
     topiq_nr_session: Option<parking_lot::Mutex<Session>>,
     topiq_iia_session: Option<parking_lot::Mutex<Session>>,
     nima_tech_session: Option<parking_lot::Mutex<Session>>,
+    /// HyperIQA（可选）：非人像场景的美学第二意见
+    hyperiqa_session: Option<parking_lot::Mutex<Session>>,
     /// InsightFace 人脸检测（可选）：存在 buffalo_l 模型时加载
     face_det: Option<crate::ai::insightface::InsightFaceEngine>,
     /// TOPIQ-NR-Face 人脸专评 session（可选）：模型存在时加载
@@ -161,6 +179,26 @@ impl AiEngine {
             }
         } else {
             log::warn!("TOPIQ-IAA 模型不存在，无美学评分");
+            None
+        };
+
+        // HyperIQA（可选）：非人像美学融合的第二意见
+        let hyperiqa_path = model_dir.join(HYPERIQA_MODEL);
+        let hyperiqa_session = if hyperiqa_path.exists() {
+            log::info!("HyperIQA 模型存在: {}", hyperiqa_path.display());
+            match Self::build_session(&hyperiqa_path, false) {
+                Ok((s, be)) => {
+                    backend = be;
+                    log::info!("HyperIQA 会话就绪，推理后端: {}", be.label());
+                    Some(parking_lot::Mutex::new(s))
+                }
+                Err(e) => {
+                    log::warn!("HyperIQA 加载失败，跳过非人像美学融合: {}", e);
+                    None
+                }
+            }
+        } else {
+            log::info!("HyperIQA 模型不存在，跳过非人像美学融合");
             None
         };
 
@@ -247,6 +285,7 @@ impl AiEngine {
             topiq_nr_session,
             topiq_iia_session,
             nima_tech_session,
+            hyperiqa_session,
             face_det,
             face_session,
             scene_session,
@@ -681,10 +720,28 @@ impl AiEngine {
             .collect();
         match crate::ai::topiq_face::face_quality_scores(&mut sess_guard, &crop_owned) {
             Ok(vals) => {
+                // 人像融合第二意见：TOPIQ-NR 对同一批对齐 crop 打技术分（nr-on-face）。
+                // nr_face 对欠曝人像不扣分（暗光盲区），nr-on-face 对模糊/压缩/低清/欠曝
+                // 全部强敏感——50/50 融合把盲区归零、平均降级敏感度 ×3.6（357 张基准标定）。
+                let nr10: Option<Vec<f32>> = if self.topiq_nr_session.is_some() {
+                    crate::ai::preprocess::face_crops_to_batch_topiq(&crop_owned)
+                        .ok()
+                        .and_then(|b| self.topiq_nr_scores(&b).ok())
+                } else {
+                    None
+                };
+                let w = FACE_FUSION_NR_FACE_WEIGHT;
                 for (k, &val) in vals.iter().enumerate() {
                     if k < crops.len() {
                         let idx = crops[k].0;
-                        scores[idx] = Some(crate::ai::topiq_face::map_to_ten_scale(val));
+                        let nrf10 = crate::ai::topiq_face::map_to_ten_scale(val);
+                        let fused = match nr10.as_ref().and_then(|v| v.get(k)) {
+                            Some(&nro10) => {
+                                (w * nrf10 + (1.0 - w) * nro10).clamp(1.0, 10.0)
+                            }
+                            None => nrf10,
+                        };
+                        scores[idx] = Some(fused);
                     }
                 }
             }
@@ -704,6 +761,23 @@ impl AiEngine {
     /// 是否启用了 TOPIQ-IAA 美学评分模型（优先级最高）。
     pub fn has_topiq_iia(&self) -> bool {
         self.topiq_iia_session.is_some()
+    }
+
+    /// HyperIQA（非人像美学第二意见）是否可用。
+    pub fn has_hyperiqa(&self) -> bool {
+        self.hyperiqa_session.is_some()
+    }
+
+    /// HyperIQA 原始质量分（[0,1]）。输入 `[N,3,512,512]` CHW、[0,1]（见
+    /// [`crate::ai::preprocess::images_to_batch_raw01_512`]），导出图内含归一化。
+    pub fn hyperiqa_scores(&self, batch: &Array4<f32>) -> anyhow::Result<Vec<f32>> {
+        let Some(sess) = &self.hyperiqa_session else {
+            anyhow::bail!("HyperIQA 会话未初始化");
+        };
+        let tensor = ort::value::Tensor::from_array(batch.clone())?;
+        let mut session = sess.lock();
+        let outputs = session.run(ort::inputs!["input" => tensor])?;
+        Ok(outputs[0].try_extract_array::<f32>()?.iter().copied().collect())
     }
 
     /// TOPIQ-NR 技术质量评分（ResNet50，KonIQ-10k，输出 0~1 标量）。
