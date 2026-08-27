@@ -1,0 +1,73 @@
+# ============================================================
+# PixSweep .gitignore
+# 只上传必要的源码、文档、模型；排除所有构建产物与过程文件。
+# ============================================================
+
+# --- Rust 构建产物 ---
+target/
+**/*.rs.bk
+
+# --- 前端构建产物 ---
+node_modules
+dist
+dist-ssr
+
+# --- 模型文件（体积大 ~932MB，不入库；通过发布包 dist-package/ 分发）---
+# 注意：ONNX 外部权重扩展名是 .data（如 clipiqa_model.onnx.data / topiq_nr.onnx.data），
+# 以及场景模型的 mobilenet_v3_large.data，必须递归忽略（子目录 eye/、scene/ 等）。
+# `**/*.data` 同时覆盖 `*.onnx.data`（配对权重）与 `*.data`（场景权重）。
+src-tauri/models/**/*.onnx
+src-tauri/models/**/*.data
+src-tauri/models/**/*.bin
+
+# --- Tauri 构建生成物（tauri build 自动生成 schema）---
+src-tauri/gen/
+
+# --- 本机特定构建配置（含本机绝对路径 xwin-sdk 位置，见 AGENT.md）---
+src-tauri/.cargo/
+
+# --- 构建工具链（xwin SDK / zig / wrapper，2.2G，不入库）---
+.tools/
+
+# --- 临时目录（如一次性模型导出用的 Python 环境）---
+.tmp_*/
+
+# --- 编辑器 / 系统 ---
+.vscode
+.idea
+*.swp
+.DS_Store
+
+# --- 日志 ---
+*.log
+
+# --- 打包产物（dist-package 下的 zip 不入库）---
+dist-package/
+
+# --- 已弃用模型存档（MUSIQ 等，不参与打包，不入库）---
+models-archive/
+
+# --- 编译产物二进制（exe/dll/pdb，从 Release 下载）---
+*.exe
+*.dll
+*.pdb
+
+# --- 测试图片（用户真实照片大目录，不入库）---
+test_photos/
+
+# 临时 Python 依赖（模型验证用）
+.pytmp/
+*.py.tmp
+ocec_check.py
+
+# --- AI 模型重导出工作区（venv/权重/中间产物，体积大不入库）---
+.scratch/ai-scoring-performance/venv/
+.scratch/ai-scoring-performance/weights/
+.scratch/ai-scoring-performance/tmp_work/
+.scratch/ai-scoring-performance/topiq_src/
+
+# --- 本机隐私信息（真实路径/用户名/机器信息，见 AGENT.md 隐私约定）---
+/PRIVATE.local.md
+
+# --- 本地 issue/spec 工作目录（含机器特定路径，属本地工作文件不入库）---
+/.scratch/

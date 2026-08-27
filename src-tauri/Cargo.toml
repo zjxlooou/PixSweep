@@ -1,0 +1,82 @@
+[package]
+name = "pixsweep"
+version = "0.7.3"
+description = "PixSweep - AI-powered duplicate image cleaner for Windows"
+authors = ["PixSweep"]
+edition = "2021"
+rust-version = "1.77"
+
+[lib]
+name = "pixsweep_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+# ---- Tauri ----
+# custom-protocol：生产模式嵌入前端资源（否则会连接 devUrl localhost）
+tauri = { version = "2", features = ["custom-protocol"] }
+tauri-plugin-dialog = "2"
+tauri-plugin-fs = "2"
+tauri-plugin-shell = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# ---- File system ----
+walkdir = "2"
+blake3 = { version = "1", default-features = false, features = ["pure", "std"] }
+# 移动到系统回收站（Windows Recycle Bin），用于"清理缓存进系统回收站"
+trash = "5"
+
+# ---- Image processing ----
+image = { version = "0.25", default-features = false, features = ["jpeg", "png", "webp", "bmp", "gif", "tiff"] }
+
+# ---- Database ----
+# 使用 JSON 文件存储（纯 Rust，无 C 编译依赖）
+
+# ---- Concurrency ----
+tokio = { version = "1", features = ["full"] }
+rayon = "1"
+parking_lot = "0.12"
+
+# ---- Utilities ----
+uuid = { version = "1", features = ["v4"] }
+log = "0.4"
+env_logger = "0.11"
+anyhow = "1"
+base64 = "0.22"
+chrono = "0.4"
+
+# ---- AI inference (feature = "ai") ----
+ort = { version = "2.0.0-rc.10", features = ["half"], optional = true }
+ndarray = { version = "0.17", optional = true }
+half = { version = "2", optional = true }
+
+[features]
+# 默认启用 AI + 三级 GPU 回退链（CUDA → DirectML → CPU）：
+# - **CUDA**（NVIDIA）：PyTorch 原生后端，几乎所有 ONNX 模型都兼容
+# - **DirectML**（NVIDIA/AMD/Intel 通用）：兜底 GPU 加速
+# - **CPU**：最后保底（部分模型因算子兼容性只能 CPU 跑）
+# 运行时按顺序探测，session 创建时自动注入 EP 列表。
+default = ["ai", "cuda", "directml"]
+# Disable AI inference (fallback to perceptual hashing only):
+#   cargo build --no-default-features
+ai = ["dep:ort", "dep:ndarray", "dep:half"]
+# CUDA 硬件加速（NVIDIA 显卡，需安装 NVIDIA 驱动；POC 验证 4× 快于 CPU）
+cuda = ["ai", "ort/cuda"]
+# DirectML 硬件加速（Windows 标准 DirectX 12 API，支持 NVIDIA/AMD/Intel 所有显卡，
+# 兜底 GPU 加速，无需安装 CUDA Toolkit / cuDNN）。
+directml = ["ai", "ort/directml"]
+
+[profile.release]
+panic = "abort"
+# 编译速度优先：关闭 LTO + 单代码生成单元（减少 .o 文件数，避免机械硬盘 I/O 瓶颈）
+codegen-units = 1
+lto = false
+opt-level = 2
+strip = true
+
+# 开发构建：关闭优化，秒级增量编译
+[profile.dev]
+opt-level = 0

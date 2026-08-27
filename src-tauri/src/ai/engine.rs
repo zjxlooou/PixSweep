@@ -1,0 +1,1396 @@
+//! AI 引擎：封装 ONNX Runtime 会话，三级 GPU 回退链（CUDA → DirectML → CPU）。
+//!
+//! - **CUDA**（NVIDIA）：PyTorch 原生后端，优先选用
+//! - **DirectML**（NVIDIA/AMD/Intel 通用）：兜底 GPU 加速
+//! - **CPU**：最后保底
+//!
+//! 运行时按顺序探测，session 创建时自动注入 EP 列表（失败则降级）。
+//!
+//! 评分体系（双维度）：
+//! - **技术评分**：TOPIQ-NR（ResNet50，KonIQ-10k，主用）→ CLIP-IQA+（CPU EP 后备）→ NIMA（二级后备）
+//! - **美学评分**：TOPIQ-IAA（ResNet50，AVA，主用）→ LAION Aesthetics V1 线性头（依赖 CLIP embedding，后备）
+//! 综合评分 = 美学 × w_a + 技术 × w_t + 启发式，用于组内挑选最佳照片。
+//!
+//! 去重核心：CLIP ViT-B/32 提取 embedding 做相似度聚类（独立于评分体系，始终保留）。
+
+use crate::ai::clip::{CLIP_EMBEDDING_DIM, INPUT_NAME as CLIP_INPUT, OUTPUT_NAME as CLIP_OUTPUT};
+use crate::ai::nima::{INPUT_NAME as NIMA_INPUT, OUTPUT_NAME as NIMA_OUTPUT};
+use crate::ai::topiq::{
+    IAA_OUTPUT_NAME as TOPIQ_IAA_OUTPUT, INPUT_NAME as TOPIQ_INPUT,
+    NR_OUTPUT_NAME as TOPIQ_NR_OUTPUT, topiq_iaa_to_score, topiq_nr_to_score,
+};
+use ndarray::Array4;
+use ort::ep::{CPU, DirectML, ExecutionProvider};
+use ort::session::builder::{GraphOptimizationLevel, SessionBuilder};
+use ort::session::Session;
+
+/// CLIP 模型文件名。
+pub const CLIP_MODEL: &str = "clip-vit-b32-visual.onnx";
+/// NIMA 技术质量模型文件名（MobileNet 224×224，10-bin MOS 分布）。
+pub const NIMA_TECH_MODEL: &str = "nima-technical.onnx";
+/// CLIP-IQA+ 技术质量模型文件名（CLIP/RN50 零样本质量评估，输出 0~1）。
+pub const CLIP_IQA_MODEL: &str = "clipiqa_model.onnx";
+/// CLIP-IQA 模型输入张量名称（86Cao/IQA-ONNX-Models 导出约定）。
+pub const CLIP_IQA_INPUT: &str = "input";
+/// LAION 美学线性头权重文件（原始 .pth 导出的二进制）。
+pub const AESTHETIC_WEIGHTS: &str = "aesthetic_linear.bin";
+/// TOPIQ-NR 技术质量模型文件名（ResNet50，KonIQ-10k，输出 0~1）。
+pub const TOPIQ_NR_MODEL: &str = "topiq_nr.onnx";
+/// TOPIQ-IAA 美学模型文件名（ResNet50，AVA，输出 10-bin softmax）。
+pub const TOPIQ_IAA_MODEL: &str = "topiq_iaa_res50.onnx";
+
+/// 综合评分权重。
+/// 场景是"组内选最佳"：组内照片内容相同，美学分必然接近，
+/// 对焦/清晰度才是决定性维度，故对焦权重最高。
+pub const WEIGHT_AESTHETIC: f32 = 0.25;
+pub const WEIGHT_FOCUS: f32 = 0.6;
+pub const WEIGHT_HEURISTIC: f32 = 0.15;
+
+/// 人像场景权重（有人脸且人脸分有效时主导）。人像 = **人像美学(人脸分) 主导** +
+/// **眼部对焦** + 启发式；整图美学/技术不参与（见用户流程：五官/闭眼/眼部对焦/人像美学）。
+pub const W_FACE_A: f32 = 0.0;
+pub const W_FACE_FOCUS: f32 = 0.30;
+pub const W_FACE_F: f32 = 0.55;
+pub const W_FACE_H: f32 = 0.15;
+/// 风景场景权重（画质优先，对焦分略高）。
+pub const W_LAND_A: f32 = 0.40;
+pub const W_LAND_FOCUS: f32 = 0.50;
+pub const W_LAND_H: f32 = 0.10;
+/// 宠物场景权重（美学/对焦均衡）。
+pub const W_PET_A: f32 = 0.45;
+pub const W_PET_FOCUS: f32 = 0.45;
+pub const W_PET_H: f32 = 0.10;
+
+/// 推理加速后端。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GpuBackend {
+    /// CUDA（NVIDIA 原生 GPU 加速，POC 验证比 CPU 快 4×）
+    Cuda,
+    /// DirectML（Windows 标准 DirectX 12，任何显卡通用，CUDA 不可用时回退）
+    DirectML,
+    /// 纯 CPU（最后保底）
+    Cpu,
+}
+
+impl GpuBackend {
+    pub fn label(&self) -> &'static str {
+        match self {
+            GpuBackend::Cuda => "CUDA (NVIDIA GPU)",
+            GpuBackend::DirectML => "DirectML (DirectX 12)",
+            GpuBackend::Cpu => "CPU",
+        }
+    }
+
+    pub fn is_gpu(&self) -> bool {
+        matches!(self, GpuBackend::Cuda | GpuBackend::DirectML)
+    }
+}
+
+/// LAION 美学线性头（512 维 → 标量），加载自导出的二进制权重。
+pub struct AestheticHead {
+    weight: Vec<f32>, // 512 个
+    bias: f32,
+}
+
+impl AestheticHead {
+    /// 从二进制文件加载权重：前 512 个 f32 为 weight，最后一个 f32 为 bias。
+    pub fn load(path: &std::path::Path) -> anyhow::Result<Self> {
+        let bytes = std::fs::read(path)
+            .map_err(|e| anyhow::anyhow!("读取美学权重失败 {}: {}", path.display(), e))?;
+        let expected = (CLIP_EMBEDDING_DIM + 1) * 4;
+        if bytes.len() < expected {
+            anyhow::bail!(
+                "美学权重文件大小异常 {}: 期望 >= {} 字节, 实际 {}",
+                path.display(),
+                expected,
+                bytes.len()
+            );
+        }
+        let mut weight = Vec::with_capacity(CLIP_EMBEDDING_DIM);
+        for i in 0..CLIP_EMBEDDING_DIM {
+            weight.push(f32::from_le_bytes(bytes[i * 4..i * 4 + 4].try_into().unwrap()));
+        }
+        let bias_bytes: [u8; 4] = bytes[CLIP_EMBEDDING_DIM * 4..CLIP_EMBEDDING_DIM * 4 + 4]
+            .try_into()
+            .unwrap();
+        let bias = f32::from_le_bytes(bias_bytes);
+        Ok(Self { weight, bias })
+    }
+
+    /// 对已 L2 归一化的 CLIP embedding 计算美学分（1.0~10.0）。
+    pub fn predict(&self, embedding: &[f32]) -> f32 {
+        let dot: f32 = self
+            .weight
+            .iter()
+            .zip(embedding.iter())
+            .map(|(w, x)| w * x)
+            .sum();
+        let logit = dot + self.bias;
+        // sigmoid 映射到 (0,1)，再映射到 1~10
+        let s = 1.0 / (1.0 + (-logit).exp());
+        1.0 + s * 9.0
+    }
+}
+
+/// AI 推理引擎，持有 CLIP（去重）+ TOPIQ-NR/IAA（主评分）+ CLIP-IQA/NIMA（后备）+ 美学线性头。
+pub struct AiEngine {
+    clip_session: parking_lot::Mutex<Session>,
+    topiq_nr_session: Option<parking_lot::Mutex<Session>>,
+    topiq_iia_session: Option<parking_lot::Mutex<Session>>,
+    clipiqa_session: Option<parking_lot::Mutex<Session>>,
+    nima_tech_session: Option<parking_lot::Mutex<Session>>,
+    aesthetic_head: Option<AestheticHead>,
+    /// InsightFace 人脸检测（可选）：存在 buffalo_l 模型时加载
+    face_det: Option<crate::ai::insightface::InsightFaceEngine>,
+    /// TOPIQ-NR-Face 人脸专评 session（可选）：模型存在时加载
+    face_session: Option<parking_lot::Mutex<Session>>,
+    /// MobileNetV3 场景分类 session（可选）：模型存在时加载
+    scene_session: Option<parking_lot::Mutex<Session>>,
+    /// OCEC 闭眼检测器（可选）：模型存在时加载
+    eye_det: Option<crate::ai::eye::EyeDetector>,
+    backend: GpuBackend,
+}
+
+impl AiEngine {
+    /// 初始化引擎：优先 DirectML，失败回退 CPU。
+    /// 加载顺序：CLIP（必需）→ NIMA 技术质量（可选）→ 美学头（可选）。
+    pub fn new(model_dir: &std::path::Path) -> anyhow::Result<Self> {
+        let clip_path = model_dir.join(CLIP_MODEL);
+        let tech_path = model_dir.join(NIMA_TECH_MODEL);
+        let aesthetic_path = model_dir.join(AESTHETIC_WEIGHTS);
+
+        log::info!("AI 引擎初始化，模型目录: {}", model_dir.display());
+        log::info!("DirectML 编译支持: {}", directml_available());
+        if !clip_path.exists() {
+            anyhow::bail!("CLIP 模型不存在: {}", clip_path.display());
+        }
+        log::info!("CLIP 模型存在: {}", clip_path.display());
+
+        let (clip_session, backend) = Self::build_session(&clip_path, false)?;
+        let clip_session = parking_lot::Mutex::new(clip_session);
+        log::info!("CLIP 会话就绪，推理后端: {}", backend.label());
+
+        // 美学线性头（可选）：缺失时无美学分，用启发式
+        let aesthetic_head = if aesthetic_path.exists() {
+            match AestheticHead::load(&aesthetic_path) {
+                Ok(h) => {
+                    log::info!("LAION 美学头加载成功: {}", aesthetic_path.display());
+                    Some(h)
+                }
+                Err(e) => {
+                    log::warn!("美学头加载失败，使用启发式评分: {}", e);
+                    None
+                }
+            }
+        } else {
+            log::warn!("美学头不存在，使用启发式评分: {}", aesthetic_path.display());
+            None
+        };
+
+        // NIMA 技术质量模型（可选）：作为 CLIP-IQA 不可用时的兼容后备
+        let nima_tech_session = if tech_path.exists() {
+            log::info!("NIMA 技术模型存在: {}", tech_path.display());
+            match Self::build_session(&tech_path, false) {
+                Ok((s, be)) => {
+                    log::info!("NIMA 技术会话就绪，推理后端: {}", be.label());
+                    Some(parking_lot::Mutex::new(s))
+                }
+                Err(e) => {
+                    log::warn!("NIMA 技术模型加载失败，跳过技术评分: {}", e);
+                    None
+                }
+            }
+        } else {
+            log::warn!("NIMA 技术模型不存在，跳过技术评分（使用启发式）");
+            None
+        };
+
+        // CLIP-IQA+ 技术质量模型（可选，主用）：缺失时回退 NIMA
+        let clipiqa_path = model_dir.join(CLIP_IQA_MODEL);
+        let clipiqa_session = if clipiqa_path.exists() {
+            log::info!("CLIP-IQA 模型存在: {}", clipiqa_path.display());
+            log::info!("CLIP-IQA 强制使用 CPU EP（DirectML 对 Reshape op 不兼容）");
+            match Self::build_session(&clipiqa_path, true) {
+                Ok((s, be)) => {
+                    log::info!("CLIP-IQA 会话就绪，推理后端: {}", be.label());
+                    Some(parking_lot::Mutex::new(s))
+                }
+                Err(e) => {
+                    log::warn!("CLIP-IQA 模型加载失败，回退 NIMA 技术评分: {}", e);
+                    None
+                }
+            }
+        } else {
+            log::warn!(
+                "CLIP-IQA 模型不存在，使用 NIMA 技术评分: {}",
+                clipiqa_path.display()
+            );
+            None
+        };
+
+        // TOPIQ-NR 技术质量模型（主用，ResNet50）：优先 DirectML，失败回退 CPU
+        let topiq_nr_path = model_dir.join(TOPIQ_NR_MODEL);
+        let topiq_nr_session = if topiq_nr_path.exists() {
+            log::info!("TOPIQ-NR 模型存在: {}", topiq_nr_path.display());
+            match Self::build_session(&topiq_nr_path, false) {
+                Ok((s, be)) => {
+                    log::info!("TOPIQ-NR 会话就绪，推理后端: {}", be.label());
+                    Some(parking_lot::Mutex::new(s))
+                }
+                Err(e) => {
+                    log::warn!("TOPIQ-NR 模型加载失败，回退 CLIP-IQA/NIMA: {}", e);
+                    None
+                }
+            }
+        } else {
+            log::warn!("TOPIQ-NR 模型不存在，使用 CLIP-IQA/NIMA 技术评分");
+            None
+        };
+
+        // TOPIQ-IAA 美学模型（主用，ResNet50）：优先 DirectML，失败回退 CPU
+        let topiq_iia_path = model_dir.join(TOPIQ_IAA_MODEL);
+        let topiq_iia_session = if topiq_iia_path.exists() {
+            log::info!("TOPIQ-IAA 模型存在: {}", topiq_iia_path.display());
+            match Self::build_session(&topiq_iia_path, false) {
+                Ok((s, be)) => {
+                    log::info!("TOPIQ-IAA 会话就绪，推理后端: {}", be.label());
+                    Some(parking_lot::Mutex::new(s))
+                }
+                Err(e) => {
+                    log::warn!("TOPIQ-IAA 模型加载失败，回退 LAION 美学头: {}", e);
+                    None
+                }
+            }
+        } else {
+            log::warn!("TOPIQ-IAA 模型不存在，使用 LAION 美学头");
+            None
+        };
+
+        // InsightFace buffalo_l 人脸检测（可选）：存在 models/insightface/ 时加载
+        let insightface_dir = model_dir.join("insightface");
+        let face_det = if insightface_dir.join("det_10g.onnx").exists() {
+            log::info!("InsightFace 检测模型存在，加载人脸检测: {}", insightface_dir.display());
+            let eng = crate::ai::insightface::InsightFaceEngine::new();
+            match eng.load(&insightface_dir, false) {
+                Ok(()) => {
+                    log::info!("InsightFace 人脸检测就绪");
+                    Some(eng)
+                }
+                Err(e) => {
+                    log::warn!("InsightFace 人脸检测加载失败，跳过人脸专评: {}", e);
+                    None
+                }
+            }
+        } else {
+            log::warn!("InsightFace 检测模型不存在，跳过人脸专评: {}", insightface_dir.display());
+            None
+        };
+
+        // TOPIQ-NR-Face 人脸专评（可选）：模型存在时加载
+        let face_path = model_dir.join(crate::ai::topiq_face::MODEL_NAME);
+        let face_session = if face_path.exists() {
+            log::info!("TOPIQ-NR-Face 模型存在: {}", face_path.display());
+            match Self::build_session(&face_path, false) {
+                Ok((s, be)) => {
+                    log::info!("TOPIQ-NR-Face 会话就绪，推理后端: {}", be.label());
+                    Some(parking_lot::Mutex::new(s))
+                }
+                Err(e) => {
+                    log::warn!("TOPIQ-NR-Face 模型加载失败，跳过人脸专评: {}", e);
+                    None
+                }
+            }
+        } else {
+            log::warn!("TOPIQ-NR-Face 模型不存在，跳过人脸专评");
+            None
+        };
+
+        // MobileNetV3 场景分类（可选）：模型存在时加载（在 models/scene/ 子目录）
+        let scene_dir = model_dir.join("scene");
+        let scene_path = scene_dir.join(crate::ai::scene::MODEL_NAME);
+        let scene_session = if scene_path.exists() {
+            log::info!("MobileNetV3 场景分类模型存在: {}", scene_path.display());
+            match Self::build_session(&scene_path, false) {
+                Ok((s, be)) => {
+                    log::info!("场景分类会话就绪，推理后端: {}", be.label());
+                    Some(parking_lot::Mutex::new(s))
+                }
+                Err(e) => {
+                    log::warn!("场景分类模型加载失败，跳过场景识别: {}", e);
+                    None
+                }
+            }
+        } else {
+            log::warn!("场景分类模型不存在，跳过场景识别");
+            None
+        };
+
+        // OCEC 闭眼检测（可选）：模型存在时加载（在 models/eye/ 子目录）
+        let eye_dir = model_dir.join("eye");
+        let eye_det = if eye_dir.join(crate::ai::eye::MODEL_NAME).exists() {
+            log::info!("OCEC 闭眼检测模型存在: {}", eye_dir.display());
+            let det = crate::ai::eye::EyeDetector::new();
+            match det.load(&eye_dir) {
+                Ok(d) => {
+                    log::info!("OCEC 闭眼检测就绪");
+                    Some(d)
+                }
+                Err(e) => {
+                    log::warn!("OCEC 加载失败，跳过闭眼检测: {}", e);
+                    None
+                }
+            }
+        } else {
+            log::warn!("OCEC 模型不存在，跳过闭眼检测: {}", eye_dir.display());
+            None
+        };
+
+        Ok(Self {
+            clip_session,
+            topiq_nr_session,
+            topiq_iia_session,
+            clipiqa_session,
+            nima_tech_session,
+            aesthetic_head,
+            face_det,
+            face_session,
+            scene_session,
+            eye_det,
+            backend,
+        })
+    }
+
+    /// 构建会话：三级回退（CUDA → DirectML → CPU）。
+    ///
+    /// `force_cpu=true` 时跳过 GPU：某些模型的个别 op 在 GPU 跑期会报错
+    /// （例如 CLIP-IQA+ 的 `Reshape` 节点，DirectML 返回 E_INVALIDARG），
+    /// 此时直接用 CPU EP 最稳妥——模型能正常加载且推理确定。
+    pub(super) fn build_session(
+        path: &std::path::Path,
+        force_cpu: bool,
+    ) -> anyhow::Result<(Session, GpuBackend)> {
+        if !force_cpu {
+            // 1) CUDA 优先（NVIDIA GPU，POC 验证最稳）
+            #[cfg(feature = "cuda")]
+            {
+                if let Some(s) = Self::try_build_cuda(path) {
+                    log::info!("CUDA 会话构建成功: {}", path.display());
+                    return Ok((s, GpuBackend::Cuda));
+                }
+                log::warn!("CUDA 会话构建失败: {}", path.display());
+            }
+            // 2) DirectML 兜底（NVIDIA/AMD/Intel 通用）
+            #[cfg(feature = "directml")]
+            {
+                if let Some(s) = Self::try_build_directml(path) {
+                    log::info!("DirectML 会话构建成功: {}", path.display());
+                    return Ok((s, GpuBackend::DirectML));
+                }
+                log::warn!("DirectML 会话构建失败: {}", path.display());
+            }
+        }
+
+        // 3) CPU 最后保底
+        let s = Self::try_build_cpu(path)
+            .ok_or_else(|| anyhow::anyhow!("无法加载模型: {}", path.display()))?;
+        log::info!("CPU 会话构建成功: {}", path.display());
+        Ok((s, GpuBackend::Cpu))
+    }
+
+    /// 统一配置会话选项，保证推理可复现且满足 DirectML EP 的强制要求：
+    ///
+    /// - `with_parallel_execution(false)`：DirectML 不支持并行执行，必须顺序执行
+    ///   （否则 `commit_from_file` 直接报错）；
+    /// - `with_memory_pattern(false)`：DirectML 要求关闭内存模式优化；
+    /// - `with_intra_threads(1)`：单线程 intra-op 归约，消除浮点求和顺序带来的
+    ///   非确定性——这正是"同一张图有时高分有时低分"的根因。
+    fn configure_session_builder(mut builder: SessionBuilder) -> Option<SessionBuilder> {
+        builder = builder
+            .with_optimization_level(GraphOptimizationLevel::Level3)
+            .ok()?
+            .with_parallel_execution(false)
+            .ok()?
+            .with_memory_pattern(false)
+            .ok()?
+            .with_intra_threads(1)
+            .ok()?;
+        Some(builder)
+    }
+
+    /// 尝试用 CUDA EP 构建会话（NVIDIA 原生 GPU 加速，POC 验证最快）。
+    ///
+    /// 先用 CUDA 驱动 API（`nvcuda.dll` 的 `cuInit` + `cuDeviceGetCount`）真实验证
+    /// 设备数：装过带 cudart 的软件会让 EP DLL 加载成功，但无 N 卡时推理会静默
+    /// 回退 CPU——必须以驱动级设备枚举为准，否则后端标签误报 CUDA。
+    #[cfg(feature = "cuda")]
+    fn try_build_cuda(path: &std::path::Path) -> Option<Session> {
+        use ort::ep::CUDA;
+        if !cuda_device_available() {
+            log::warn!("CUDA 驱动未检测到 NVIDIA GPU 设备，跳过 CUDA EP: {}", path.display());
+            return None;
+        }
+        let builder = Self::configure_session_builder(Session::builder().ok()?)?;
+        let ep = CUDA::default().with_device_id(0).build();
+        let mut builder = builder.with_execution_providers([ep]).ok()?;
+        match builder.commit_from_file(path) {
+            Ok(s) => Some(s),
+            Err(e) => {
+                log::warn!("CUDA commit 失败 {}: {}", path.display(), e);
+                None
+            }
+        }
+    }
+
+    /// 尝试用 DirectML EP 构建会话（Windows 标准硬件加速）。
+    #[cfg(feature = "directml")]
+    fn try_build_directml(path: &std::path::Path) -> Option<Session> {
+        let builder = Self::configure_session_builder(Session::builder().ok()?)?;
+        let ep = DirectML::default().build();
+        let mut builder = builder.with_execution_providers([ep]).ok()?;
+        match builder.commit_from_file(path) {
+            Ok(s) => Some(s),
+            Err(e) => {
+                log::warn!("DirectML commit 失败 {}: {}", path.display(), e);
+                None
+            }
+        }
+    }
+
+    /// 用 CPU EP 构建会话。
+    fn try_build_cpu(path: &std::path::Path) -> Option<Session> {
+        let builder = Self::configure_session_builder(Session::builder().ok()?)?;
+        let ep = CPU::default().build();
+        let mut builder = builder.with_execution_providers([ep]).ok()?;
+        builder.commit_from_file(path).ok()
+    }
+
+    /// 当前使用的推理后端。
+    pub fn backend(&self) -> GpuBackend {
+        self.backend
+    }
+
+    /// 是否启用了 GPU 加速（DirectML）。
+    pub fn gpu_enabled(&self) -> bool {
+        self.backend.is_gpu()
+    }
+
+    /// 人脸专评是否可用（需要 InsightFace 检测 + TOPIQ-NR-Face 模型）。
+    pub fn face_scoring_available(&self) -> bool {
+        self.face_det.is_some() && self.face_session.is_some()
+    }
+
+    /// 场景分类是否可用（MobileNetV3 模型存在）。
+    pub fn scene_scoring_available(&self) -> bool {
+        self.scene_session.is_some()
+    }
+
+    /// 闭眼检测是否可用（OCEC 模型存在）。
+    pub fn eye_status_available(&self) -> bool {
+        self.eye_det.as_ref().map(|e| e.is_loaded()).unwrap_or(false)
+            && self.face_det.is_some()
+    }
+
+    /// 对一批图片做闭眼检测，返回每张图的 `max(open_l, open_r) ∈ [0,1]`。
+    ///
+    /// - 1.0 = 至少一眼全开（无闭眼降权）；0.0 = 双眼全闭（最大降权）。
+    /// - 无人脸 / 未启用 / 人脸检测失败 / ROI 采样失败 → 1.0（默认不降权）。
+    /// - 双信号融合：OCEC 判眨眼式闭合，脸网格（`face_landmarker.onnx`，可选）判垂目式
+    ///   闭合——取两者较小值；网格缺失或拟合失败时自动退化为仅 OCEC。
+    ///
+    /// 实现逻辑：复用 `face_det` 重新检测 → 取最大脸 → OCEC + 脸网格推理。
+    /// 注意：这是二次图像 I/O，可接受延迟（人脸检测 ~50ms + OCEC ~1ms + 网格几 ms）。
+    pub fn eye_open_probs(&self, paths: &[String], has_faces: &[bool]) -> Vec<f32> {
+        let n = paths.len();
+        let mut results = vec![1.0f32; n];
+        if n == 0 || !self.eye_status_available() {
+            return results;
+        }
+        let (Some(face_engine), Some(eye_det)) = (&self.face_det, &self.eye_det) else {
+            return results;
+        };
+
+        for (i, path) in paths.iter().enumerate() {
+            // 仅处理 has_faces[i] = true 的图
+            if !has_faces.get(i).copied().unwrap_or(false) {
+                continue;
+            }
+            // 加载原图
+            let img = match crate::image_io::load_image_oriented(path) {
+                Ok(img) => img.to_rgb8(),
+                Err(e) => {
+                    log::warn!("[eye] 加载原图失败 {}: {}", path, e);
+                    continue;
+                }
+            };
+            let (w, h) = (img.width(), img.height());
+            let rgb = img.as_raw();
+            // 检测人脸
+            let faces = match face_engine.detect(rgb, h, w) {
+                Ok(f) => f,
+                Err(e) => {
+                    log::warn!("[eye] 人脸检测失败 {}: {}", path, e);
+                    continue;
+                }
+            };
+            if faces.is_empty() {
+                continue;
+            }
+            // 取最大脸
+            let max_face = faces
+                .iter()
+                .max_by(|a, b| {
+                    let area_a = (a.bbox[2] - a.bbox[0]) * (a.bbox[3] - a.bbox[1]);
+                    let area_b = (b.bbox[2] - b.bbox[0]) * (b.bbox[3] - b.bbox[1]);
+                    area_a.partial_cmp(&area_b).unwrap_or(std::cmp::Ordering::Equal)
+                })
+                .copied();
+            if let Some(face) = max_face {
+                // 网格为主信号（垂目+眨眼几何都敏感，且提供精确虹膜中心修复 OCEC 采样）。
+                // OCEC 仅作"眨眼否决"：网格判半开以上时其假闭误报较多（如刘海遮挡的睁眼），
+                // 只在网格也模棱两可（< MESH_VETO_BAND）而 OCEC 双眼都强判闭（取 min <
+                // OCEC_VETO_MAX）时采信——否决语义与"双眼都闭才降权"的产品规则一致。
+                let mesh = eye_det.mesh_result(rgb, h, w, &face);
+                let ocec = match &mesh {
+                    Some(m) => {
+                        eye_det.detect_probs_at(rgb, h, w, m.left_eye_src, m.right_eye_src)
+                    }
+                    None => eye_det.detect_probs(face_engine, rgb, h, w, &face),
+                };
+                // 回退分支沿用历史语义 max（任一眼开即开）；否决触发用 min（双眼都闭才否决）
+                let (ocec_any, ocec_both) = ocec.map_or((1.0, 1.0), |(l, r)| (l.max(r), l.min(r)));
+                results[i] = match mesh {
+                    Some(m) => {
+                        if ocec_both < crate::ai::eye::OCEC_VETO_MAX
+                            && m.norm_open < crate::ai::eye::MESH_VETO_BAND
+                        {
+                            ocec_any.min(m.norm_open)
+                        } else {
+                            m.norm_open
+                        }
+                    }
+                    None => ocec_any,
+                };
+            }
+        }
+        results
+    }
+
+    /// 对一批图片做闭眼检测，返回 `is_any_closed` 标记数组：
+    /// - `true`：双眼都闭（`max(open) <= 0.5`）
+    /// - `false`：至少一眼睁
+    /// - 默认 `false`（未启用或无脸图）
+    ///
+    /// 由 [`Self::eye_open_probs`] 派生（`max(open) <= 0.5`），避免重复推理。
+    pub fn eye_status(&self, paths: &[String], has_faces: &[bool]) -> Vec<bool> {
+        self.eye_open_probs(paths, has_faces)
+            .iter()
+            .map(|p| crate::ai::eye::is_closed(*p))
+            .collect()
+    }
+
+    /// 对一批图片算"对焦分"（1~10）：
+    /// - 有人脸 → **眼部对焦**（取最大脸，用眼 ROI 锐度，见 [`crate::ai::focus::eye_focus_score`]）。
+    /// - 无脸 → **整图对焦**（代理图锐度，见 [`crate::ai::focus::focus_score`]）。
+    /// - 失败/未启用 → 1.0（不因对焦降权）。
+    pub fn focus_scores(&self, paths: &[String], has_faces: &[bool]) -> Vec<f32> {
+        let n = paths.len();
+        let mut out = vec![1.0f32; n];
+        if n == 0 {
+            return out;
+        }
+        for (i, path) in paths.iter().enumerate() {
+            if has_faces.get(i).copied().unwrap_or(false) {
+                if let Some(v) = self.eye_focus(path) {
+                    out[i] = v;
+                }
+            } else if let Ok(img) = crate::cache::proxy::ai_proxy(path) {
+                out[i] = crate::ai::focus::focus_score(&img);
+            }
+        }
+        out
+    }
+
+    /// 单张眼部对焦分（有人脸才调用）：原图检测最大脸 → 采样眼 ROI → 锐度取更清晰者。
+    fn eye_focus(&self, path: &str) -> Option<f32> {
+        let det = self.face_det.as_ref()?;
+        let img = crate::image_io::load_image_oriented(path).ok()?;
+        let (w, h) = (img.width(), img.height());
+        let rgb = img.to_rgb8();
+        let raw = rgb.as_raw();
+        let faces = det.detect(raw, h, w).ok()?;
+        let max_face = faces.iter().copied().max_by(|a, b| {
+            let area_a = (a.bbox[2] - a.bbox[0]) * (a.bbox[3] - a.bbox[1]);
+            let area_b = (b.bbox[2] - b.bbox[0]) * (b.bbox[3] - b.bbox[1]);
+            area_a.partial_cmp(&area_b).unwrap_or(std::cmp::Ordering::Equal)
+        })?;
+        let (lroi, rroi) = crate::ai::eye::debug_sample_eyes_rgb(raw, h, w, &max_face)?;
+        Some(crate::ai::focus::eye_focus_score(&lroi, &rroi))
+    }
+
+    /// 调试辅助：返回单张图的 MobileNetV3 argmax 类索引。
+    pub fn scene_argmax(&self, path: &str) -> usize {
+        let Some(sess) = &self.scene_session else {
+            return 0;
+        };
+        let mut guard = sess.lock();
+        crate::ai::scene::argmax_of(&mut guard, path).unwrap_or(0)
+    }
+
+    /// 返回单张图的最大人脸 bbox + 5 关键点（EXIF 转向后的原图坐标）。
+    /// 供诊断 example（`verify_landmarks` / `verify_full`）复用。
+    pub fn largest_face_landmarks(&self, path: &str) -> Option<([f32; 4], Vec<(f32, f32)>)> {
+        let face_engine = self.face_det.as_ref()?;
+        let img = crate::image_io::load_image_oriented(path).ok()?;
+        let (w, h) = (img.width(), img.height());
+        let rgb = img.to_rgb8();
+        let raw = rgb.as_raw();
+        let faces = face_engine.detect(raw, h, w).ok()?;
+        let max_face = faces
+            .iter()
+            .max_by(|a, b| {
+                let area_a = (a.bbox[2] - a.bbox[0]) * (a.bbox[3] - a.bbox[1]);
+                let area_b = (b.bbox[2] - b.bbox[0]) * (b.bbox[3] - b.bbox[1]);
+                area_a.partial_cmp(&area_b).unwrap_or(std::cmp::Ordering::Equal)
+            })
+            .copied()?;
+        Some((
+            max_face.bbox,
+            vec![
+                max_face.landmarks.left_eye,
+                max_face.landmarks.right_eye,
+                max_face.landmarks.nose,
+                max_face.landmarks.left_mouth,
+                max_face.landmarks.right_mouth,
+            ],
+        ))
+    }
+
+    /// 诊断辅助：返回单张图的 (左眼, 右眼) open 概率。
+    pub fn eye_probs(&self, path: &str) -> Option<(f32, f32)> {
+        let (Some(face_engine), Some(eye_det)) = (&self.face_det, &self.eye_det) else {
+            return None;
+        };
+        let img = crate::image_io::load_image_oriented(path).ok()?;
+        let (w, h) = (img.width(), img.height());
+        let rgb = img.to_rgb8();
+        let raw = rgb.as_raw();
+        let faces = face_engine.detect(raw, h, w).ok()?;
+        let max_face = faces
+            .iter()
+            .max_by(|a, b| {
+                let area_a = (a.bbox[2] - a.bbox[0]) * (a.bbox[3] - a.bbox[1]);
+                let area_b = (b.bbox[2] - b.bbox[0]) * (b.bbox[3] - b.bbox[1]);
+                area_a.partial_cmp(&area_b).unwrap_or(std::cmp::Ordering::Equal)
+            })
+            .copied()?;
+        eye_det.detect_probs(face_engine, raw, h, w, &max_face)
+    }
+
+    /// 对一批图片做场景分类（MobileNetV3，无脸图的风景/宠物识别）。
+    ///
+    /// 返回每张图的场景。**人像由调用方通过 has_faces 覆盖**（有脸 → Portrait）。
+    pub fn scene_scores(&self, paths: &[String]) -> Vec<crate::ai::scene::Scene> {
+        let n = paths.len();
+        if n == 0 {
+            return Vec::new();
+        }
+        let Some(sess) = &self.scene_session else {
+            return vec![crate::ai::scene::Scene::Other; n];
+        };
+        let mut guard = sess.lock();
+        match crate::ai::scene::classify(&mut guard, paths) {
+            Ok(s) => s,
+            Err(e) => {
+                log::warn!("[场景] 分类失败: {}", e);
+                vec![crate::ai::scene::Scene::Other; n]
+            }
+        }
+    }
+
+    /// 对一批图片做人脸检测 + 人脸 crop 专评。
+    ///
+    /// 返回 `(face_scores, has_faces)`：
+    /// - `face_scores[i]`：TOPIQ-NR-Face 评分（1~10，None 表示无人脸或失败）
+    /// - `has_faces[i]`：是否检测到人脸（供前端显示人像标记）
+    ///
+    /// 仅当图片检测到人脸时才跑 TOPIQ-NR-Face（省时间），否则直接 None。
+    pub fn face_scores(
+        &self,
+        paths: &[String],
+    ) -> (Vec<Option<f32>>, Vec<bool>) {
+        let n = paths.len();
+        let mut scores: Vec<Option<f32>> = vec![None; n];
+        let mut has_face = vec![false; n];
+
+        let (Some(det), Some(face_sess)) = (&self.face_det, &self.face_session) else {
+            return (scores, has_face);
+        };
+
+        // 1) 人脸检测（逐张，因为 align_face 需要原图）
+        let mut crops: Vec<(usize, Vec<u8>, u32)> = Vec::new(); // (idx, crop_rgb, side)
+        for (i, path) in paths.iter().enumerate() {
+            // 加载原图（EXIF 方向校正）
+            let img = match crate::image_io::load_image_oriented(path) {
+                Ok(img) => img,
+                Err(e) => {
+                    log::warn!("[人脸] 加载失败 {}: {}", path, e);
+                    continue;
+                }
+            };
+            let (w, h) = (img.width(), img.height());
+            let rgb = img.to_rgb8();
+            let raw = rgb.as_raw();
+
+            let faces = match det.detect(raw, h, w) {
+                Ok(f) => f,
+                Err(e) => {
+                    log::warn!("[人脸] 检测失败 {}: {}", path, e);
+                    continue;
+                }
+            };
+            if faces.is_empty() {
+                continue;
+            }
+            has_face[i] = true;
+
+            // 取最大人脸（多人照片聚焦主体）
+            let max_face = faces
+                .iter()
+                .max_by(|a, b| {
+                    let area_a = (a.bbox[2] - a.bbox[0]) * (a.bbox[3] - a.bbox[1]);
+                    let area_b = (b.bbox[2] - b.bbox[0]) * (b.bbox[3] - b.bbox[1]);
+                    area_a.partial_cmp(&area_b).unwrap_or(std::cmp::Ordering::Equal)
+                })
+                .copied();
+
+            if let Some(face) = max_face {
+                let crop = det.align_face(raw, h, w, &face, crate::ai::topiq_face::INPUT_SIZE);
+                crops.push((i, crop, crate::ai::topiq_face::INPUT_SIZE));
+            }
+        }
+
+        if crops.is_empty() {
+            return (scores, has_face);
+        }
+
+        // 2) TOPIQ-NR-Face 批量推理（人脸 crop 已是 512×512）
+        let mut sess_guard = face_sess.lock();
+        let refs: Vec<(&[u8], u32)> = crops
+            .iter()
+            .map(|(_, rgb, side)| (rgb.as_slice(), *side))
+            .collect();
+        // 转成 topiq_face 接口需要的 (Vec<u8>, u32)
+        let crop_owned: Vec<(Vec<u8>, u32)> = refs
+            .iter()
+            .map(|(rgb, side)| (rgb.to_vec(), *side))
+            .collect();
+        match crate::ai::topiq_face::face_quality_scores(&mut sess_guard, &crop_owned) {
+            Ok(vals) => {
+                for (k, &val) in vals.iter().enumerate() {
+                    if k < crops.len() {
+                        let idx = crops[k].0;
+                        scores[idx] = Some(crate::ai::topiq_face::map_to_ten_scale(val));
+                    }
+                }
+            }
+            Err(e) => {
+                log::warn!("[人脸] TOPIQ-NR-Face 推理失败: {:#}", e);
+            }
+        }
+
+        (scores, has_face)
+    }
+
+    /// 批量提取 CLIP embedding（L2 归一化后的 512 维向量）。
+    ///
+    /// 输入 `batch` 形状为 `[N, 3, 224, 224]`。
+    pub fn extract_embeddings(&self, batch: &Array4<f32>) -> anyhow::Result<Vec<Vec<f32>>> {
+        let tensor = ort::value::Tensor::from_array(batch.clone())?;
+        let mut session = self.clip_session.lock();
+        let outputs = session.run(ort::inputs![CLIP_INPUT => tensor])?;
+
+        let embeds = outputs[CLIP_OUTPUT].try_extract_array::<f32>()?;
+        let n = embeds.shape()[0];
+
+        let mut result = Vec::with_capacity(n);
+        for i in 0..n {
+            let mut vec: Vec<f32> = embeds.slice(ndarray::s![i, ..]).iter().copied().collect();
+            l2_normalize(&mut vec);
+            result.push(vec);
+        }
+
+        Ok(result)
+    }
+
+    /// 用 LAION 美学头对 CLIP embedding 打分（1.0~10.0）。
+    /// 美学头缺失时返回 None。
+    pub fn aesthetic_scores(&self, embeddings: &[Vec<f32>]) -> Option<Vec<f32>> {
+        let head = self.aesthetic_head.as_ref()?;
+        Some(embeddings.iter().map(|e| head.predict(e)).collect())
+    }
+
+    /// 是否启用了 CLIP-IQA 主技术评分模型。
+    pub fn has_clipiqa(&self) -> bool {
+        self.clipiqa_session.is_some()
+    }
+
+    /// 是否启用了 TOPIQ-NR 主技术评分模型（优先级最高）。
+    pub fn has_topiq_nr(&self) -> bool {
+        self.topiq_nr_session.is_some()
+    }
+
+    /// 是否启用了 TOPIQ-IAA 美学评分模型（优先级最高）。
+    pub fn has_topiq_iia(&self) -> bool {
+        self.topiq_iia_session.is_some()
+    }
+
+    /// TOPIQ-NR 技术质量评分（ResNet50，KonIQ-10k，输出 0~1 标量）。
+    ///
+    /// 输入 `batch` 形状为 `[N, 3, 384, 384]`（CHW + ImageNet 归一化，见 `images_to_batch_topiq`）。
+    /// 模型已重导出支持动态 batch（2026-08-25，官方 cfanet 权重），整批一次推理；
+    /// 输出映射到 1~10（线性 `1 + v*9`）。
+    pub fn topiq_nr_scores(&self, batch: &Array4<f32>) -> anyhow::Result<Vec<f32>> {
+        let Some(topiq_nr) = &self.topiq_nr_session else {
+            anyhow::bail!("TOPIQ-NR 会话未初始化");
+        };
+        let tensor = ort::value::Tensor::from_array(batch.clone())?;
+        let mut session = topiq_nr.lock();
+        let outputs = session.run(ort::inputs![TOPIQ_INPUT => tensor])?;
+        let raw = outputs[TOPIQ_NR_OUTPUT].try_extract_array::<f32>()?;
+        let n = raw.shape()[0];
+        let flat: Vec<f32> = raw.iter().copied().collect();
+        let mut scores = Vec::with_capacity(n);
+        for i in 0..n {
+            let v = flat.get(i).copied().unwrap_or(0.0);
+            scores.push(topiq_nr_to_score(v));
+        }
+        Ok(scores)
+    }
+
+    /// TOPIQ-IAA 美学评分（ResNet50，AVA，输出 10-bin softmax 分布）。
+    ///
+    /// 输入 `batch` 形状为 `[N, 3, 384, 384]`。模型已重导出支持动态 batch
+    /// （2026-08-25，官方 cfanet 权重），整批一次推理。
+    /// 输出为 1~10 范围的美学分（10-bin 加权平均）。
+    pub fn topiq_iia_scores(&self, batch: &Array4<f32>) -> anyhow::Result<Vec<f32>> {
+        let Some(topiq_iia) = &self.topiq_iia_session else {
+            anyhow::bail!("TOPIQ-IAA 会话未初始化");
+        };
+        let tensor = ort::value::Tensor::from_array(batch.clone())?;
+        let mut session = topiq_iia.lock();
+        let outputs = session.run(ort::inputs![TOPIQ_INPUT => tensor])?;
+        let dist = outputs[TOPIQ_IAA_OUTPUT].try_extract_array::<f32>()?;
+        let shape = dist.shape();
+        let n = shape[0];
+        let classes = *shape.last().unwrap_or(&10);
+        let flat: Vec<f32> = dist.iter().copied().collect();
+        let mut scores = Vec::with_capacity(n);
+        for i in 0..n {
+            let row: Vec<f32> = flat[i * classes..(i + 1) * classes].to_vec();
+            scores.push(topiq_iaa_to_score(&row));
+        }
+        Ok(scores)
+    }
+
+
+    /// CLIP-IQA+ 技术质量评分（CLIP/RN50 零样本，输出 0~1）。
+    ///
+    /// 输入 `batch` 形状为 `[N, 3, 224, 224]`（CHW + CLIP 归一化，复用 `images_to_batch`）。
+    /// 输出映射到 1~10（线性 `1 + v*9`）。
+    pub fn clipiqa_scores(&self, batch: &Array4<f32>) -> anyhow::Result<Vec<f32>> {
+        let Some(clipiqa) = &self.clipiqa_session else {
+            anyhow::bail!("CLIP-IQA 会话未初始化");
+        };
+        let tensor = ort::value::Tensor::from_array(batch.clone())?;
+        let mut session = clipiqa.lock();
+        let outputs = session.run(ort::inputs![CLIP_IQA_INPUT => tensor])?;
+        let raw = outputs[0].try_extract_array::<f32>()?;
+        // 输出形状可能是 [N] 或 [N, 1]，先摊平再逐张映射
+        let raw_vec: Vec<f32> = raw.iter().copied().collect();
+        let mut scores = Vec::with_capacity(raw_vec.len());
+        for v in raw_vec {
+            // CLIP-IQA+ 输出已 sigmoid 到 [0,1]；越界做 clamp 保护
+            scores.push(1.0 + v.clamp(0.0, 1.0) * 9.0);
+        }
+        Ok(scores)
+    }
+
+    /// NIMA 技术质量评分（MobileNet 224×224，10-bin MOS 分布），作为 CLIP-IQA 的后备。
+    ///
+    /// 输入 `batch` 形状为 `[N, 224, 224, 3]`（NHWC + MobileNet 归一化）。
+    /// 输出为 1~10 范围的浮点分数（10-bin 分布的加权平均）。
+    pub fn nima_technical_scores(&self, batch: &Array4<f32>) -> anyhow::Result<Vec<f32>> {
+        let Some(nima_tech) = &self.nima_tech_session else {
+            return Ok(Vec::new());
+        };
+        let tensor = ort::value::Tensor::from_array(batch.clone())?;
+        let mut session = nima_tech.lock();
+        let outputs = session.run(ort::inputs![NIMA_INPUT => tensor])?;
+
+        let dist = outputs[NIMA_OUTPUT].try_extract_array::<f32>()?;
+        let n = dist.shape()[0];
+
+        let mut scores = Vec::with_capacity(n);
+        for i in 0..n {
+            let row: Vec<f32> = dist.slice(ndarray::s![i, ..]).iter().copied().collect();
+            scores.push(crate::ai::nima::nima_score_from_distribution(&row));
+        }
+
+        Ok(scores)
+    }
+
+    /// 综合评分：美学 + 技术 + 人脸专评 + 启发式（分辨率/大小），加权合并为最终分。
+    ///
+    /// 权重分两档：
+    /// - **有人脸**（`has_face[i]=true` 且 `face[i]` 有值）：人脸专评主导
+    ///   （美学 0.20 + 技术 0.20 + 人脸 0.45 + 启发式 0.15）——人像优先
+    /// - **无人脸**：原公式（美学 0.25 + 技术 0.60 + 启发式 0.15）
+    ///
+    /// `aesthetic`: CLIP/TOPIQ-IAA 美学分数组（可选）
+    /// `focus`: 每张图对焦分（可选，1~10；人像=眼部对焦，非人像=整图对焦）
+    /// `face`: TOPIQ-NR-Face 人脸专评分数组（可选，1~10）
+    /// `has_face`: 是否检测到人脸
+    /// `eye_open`: 每张图 `max(open_l, open_r) ∈ [0,1]`（1=至少一眼开；0=双眼全闭）。
+    ///   **阶段二起**由布尔闭眼标记改为连续开眼概率；**阶段三**将聚合由 `min` 改为
+    ///   `max`（仅当双眼都判闭才降权），避免单眼 ROI 采到皮肤/眼镜致 0.00 就压垮
+    ///   整张睁眼花。无人脸/未启用 → 1.0。
+    /// `widths/heights/sizes`: 启发式信息
+    pub fn composite_scores(
+        &self,
+        aesthetic: Option<&[f32]>,
+        focus: Option<&[f32]>,
+        face: Option<&[f32]>,
+        has_face: &[bool],
+        scenes: &[crate::ai::scene::Scene],
+        eye_open: &[f32],
+        widths: &[u32],
+        heights: &[u32],
+        sizes: &[u64],
+    ) -> anyhow::Result<Vec<f32>> {
+        let n = widths.len();
+        let mut result = Vec::with_capacity(n);
+
+        for i in 0..n {
+            // 人脸专评值（None 表示无人脸或未启用）
+            let face_val = face.and_then(|f| f.get(i)).copied().filter(|v| *v > 0.0);
+            let is_face = has_face.get(i).copied().unwrap_or(false);
+            let scene = scenes.get(i).copied().unwrap_or(crate::ai::scene::Scene::Other);
+            let open = eye_open.get(i).copied().unwrap_or(1.0).clamp(0.0, 1.0);
+
+            // 启发式：分辨率越高分越高
+            let w = widths.get(i).copied().unwrap_or(0);
+            let h = heights.get(i).copied().unwrap_or(0);
+            let pixels = (w as u64) * (h as u64);
+            let heuristic = if pixels > 0 {
+                (10.0 * (pixels as f64 / (pixels as f64 + 2_000_000.0))) as f32
+            } else {
+                let s = sizes.get(i).copied().unwrap_or(0) as f64;
+                (10.0 * (s / (s + 3_000_000.0))) as f32
+            };
+
+            let a = aesthetic.and_then(|x| x.get(i)).copied();
+            let fo = focus.and_then(|x| x.get(i)).copied();
+            let mut s = weighted_score(a, fo, face_val, is_face, scene, heuristic);
+            // 闭眼降权（阶段二：连续平滑），见 [`eye_penalty`]
+            if is_face {
+                s *= eye_penalty(open);
+            }
+            result.push(s);
+        }
+
+        Ok(result)
+    }
+}
+
+
+/// 双缓冲流水线的分段时间（verify_ai 性能基准 / commands 日志用）。
+#[derive(Clone, Copy, Default)]
+pub struct PipelineTiming {
+    /// TOPIQ 预处理总耗时（各批求和，与推理重叠执行）。
+    pub prep_topiq_sec: f64,
+    /// CLIP 预处理总耗时（各批求和）。
+    pub prep_clip_sec: f64,
+    /// NIMA 预处理总耗时（各批求和）。
+    pub prep_nima_sec: f64,
+    /// consumer 端推理总耗时（各批求和）。
+    pub infer_sec: f64,
+    /// 整条流水线 wall-clock（含重叠，通常 < prep_sec() + infer_sec）。
+    pub wall_sec: f64,
+}
+
+impl PipelineTiming {
+    /// 预处理总耗时（三种模型的求和）。
+    pub fn prep_sec(&self) -> f64 {
+        self.prep_topiq_sec + self.prep_clip_sec + self.prep_nima_sec
+    }
+}
+
+/// 双缓冲流水线中一批图片的预处理 tensor（channel 传输单元）。
+struct BatchTensors {
+    topiq: Option<Array4<f32>>,
+    clip: Option<Array4<f32>>,
+    nima: Option<Array4<f32>>,
+}
+
+impl Default for BatchTensors {
+    fn default() -> Self {
+        Self {
+            topiq: None,
+            clip: None,
+            nima: None,
+        }
+    }
+}
+
+/// 对 `paths` 做双缓冲批量评分：producer 线程用 rayon 并行构建下一批 tensor
+/// （解码/缩放/归一化是 CPU 瓶颈），consumer 用现有单 session 推理 →
+/// 解码与 GPU 推理重叠，消除 GPU 等数据的时间。TOPIQ NR/IAA 模型已支持
+/// 动态 batch，整批一次推理摊薄 launch 开销。
+///
+/// 批内顺序、模型调用顺序、session 串行语义不变 → 分数确定可复现。
+///
+/// - 美学分：TOPIQ-IAA 优先，否则 CLIP embedding → LAION 头。
+/// - 技术分：TOPIQ-NR 优先，否则 CLIP-IQA+，否则 NIMA。
+/// - 无对应模型 / 预处理失败 → 该图对应分值为 `None`。
+///
+/// `progress(done, total)` 每批开始前调用（供进度条）。
+/// 返回 (美学分, 技术分)，均与 `paths` 等长对齐。
+pub fn score_batch_scores(
+    engine: &AiEngine,
+    paths: &[String],
+    batch_size: usize,
+    progress: &mut dyn FnMut(usize, usize),
+) -> (Vec<Option<f32>>, Vec<Option<f32>>, PipelineTiming) {
+    let n = paths.len();
+    let mut aes: Vec<Option<f32>> = vec![None; n];
+    let mut tech: Vec<Option<f32>> = vec![None; n];
+    if n == 0 {
+        return (aes, tech, PipelineTiming::default());
+    }
+    let chunks: Vec<&[String]> = paths.chunks(batch_size.max(1)).collect();
+
+    let need_topiq = engine.has_topiq_nr() || engine.has_topiq_iia();
+    let need_clip = !engine.has_topiq_iia() || (engine.has_clipiqa() && !engine.has_topiq_nr());
+    let need_nima = !engine.has_topiq_nr() && !engine.has_clipiqa();
+
+    let mut prep_topiq_sec = 0.0f64;
+    let mut prep_clip_sec = 0.0f64;
+    let mut prep_nima_sec = 0.0f64;
+    let mut infer_sec = 0.0f64;
+    let wall = std::time::Instant::now();
+
+    let (tx, rx) = std::sync::mpsc::sync_channel::<BatchTensors>(2);
+    std::thread::scope(|scope| {
+        // producer：持续预取下一批预处理 tensor（channel 容量 2：一预一推）
+        scope.spawn(|| {
+            for chunk in &chunks {
+                let mut b = BatchTensors::default();
+                if need_topiq {
+                    let t0 = std::time::Instant::now();
+                    match crate::ai::preprocess::images_to_batch_topiq(chunk) {
+                        Ok(v) => b.topiq = Some(v),
+                        Err(e) => log::warn!("TOPIQ 预处理失败: {}", e),
+                    }
+                    prep_topiq_sec += t0.elapsed().as_secs_f64();
+                }
+                if need_clip {
+                    let t0 = std::time::Instant::now();
+                    match crate::ai::preprocess::images_to_batch(chunk) {
+                        Ok(v) => b.clip = Some(v),
+                        Err(e) => log::warn!("CLIP 预处理失败: {}", e),
+                    }
+                    prep_clip_sec += t0.elapsed().as_secs_f64();
+                }
+                if need_nima {
+                    let t0 = std::time::Instant::now();
+                    match crate::ai::preprocess::images_to_batch_nima(chunk) {
+                        Ok(v) => b.nima = Some(v),
+                        Err(e) => log::warn!("NIMA 预处理失败: {}", e),
+                    }
+                    prep_nima_sec += t0.elapsed().as_secs_f64();
+                }
+                if tx.send(b).is_err() {
+                    break; // 消费者已退出
+                }
+            }
+        });
+
+        // consumer：逐批推理（与 producer 的解码重叠）
+        for (i, chunk) in chunks.iter().enumerate() {
+            progress(i * batch_size, n);
+            let b = match rx.recv() {
+                Ok(b) => b,
+                Err(_) => break, // producer 已结束
+            };
+            let t0 = std::time::Instant::now();
+
+            let aes_scores: Option<Vec<f32>> = if engine.has_topiq_iia() {
+                b.topiq
+                    .as_ref()
+                    .map(|t| engine.topiq_iia_scores(t).unwrap_or_default())
+            } else {
+                let Some(clip) = b.clip.as_ref() else {
+                    continue; // 该批无法评分（无 CLIP 预处理结果）
+                };
+                let embeddings = match engine.extract_embeddings(clip) {
+                    Ok(e) => e,
+                    Err(err) => {
+                        log::warn!("CLIP 推理失败: {}", err);
+                        continue;
+                    }
+                };
+                engine.aesthetic_scores(&embeddings)
+            };
+
+            let tech_scores: Vec<f32> = if engine.has_topiq_nr() {
+                b.topiq
+                    .as_ref()
+                    .map(|t| engine.topiq_nr_scores(t).unwrap_or_default())
+                    .unwrap_or_default()
+            } else if engine.has_clipiqa() {
+                match b.clip.as_ref() {
+                    Some(c) => engine.clipiqa_scores(c).unwrap_or_default(),
+                    None => Vec::new(),
+                }
+            } else {
+                match b.nima.as_ref() {
+                    Some(nm) => engine.nima_technical_scores(nm).unwrap_or_default(),
+                    None => Vec::new(),
+                }
+            };
+
+            for (j, _) in chunk.iter().enumerate() {
+                let idx = i * batch_size + j;
+                aes[idx] = aes_scores.as_ref().and_then(|v| v.get(j).copied());
+                tech[idx] = tech_scores.get(j).copied();
+            }
+            infer_sec += t0.elapsed().as_secs_f64();
+        }
+    });
+
+    let timing = PipelineTiming {
+        prep_topiq_sec,
+        prep_clip_sec,
+        prep_nima_sec,
+        infer_sec,
+        wall_sec: wall.elapsed().as_secs_f64(),
+    };
+    (aes, tech, timing)
+}
+
+/// 闭眼连续降权系数（阶段三）。`open = max(open_l, open_r) ∈ [0,1]`。
+///
+/// - `open >= 0.5`（至少一眼判开）→ `1.0`，不降权；
+/// - `open < 0.5`（双眼都判闭）→ 平滑降到 `0.5`，全闭取极值 `0.5`。
+///
+/// 阶段三把聚合从 `min` 改为 `max`：实测戴镜/偏脸时单眼 ROI 常采到皮肤或眼镜，
+/// OCEC 给 0.00 → 旧 `min` 会把整张明显的睁眼花压成 ×0.5，失去区分度。
+/// 改用 `max` 后只有双眼都判闭才降权，单眼噪声不再压垮整脸。
+/// 注：spec 字面 `0.5 + 0.5*open` 会对明显睁眼但 `open<1` 也降权，属回归，故采用分段。
+fn eye_penalty(open: f32) -> f32 {
+    if open >= 0.5 {
+        1.0
+    } else {
+        0.5 + open
+    }
+}
+
+/// 单张图片的综合加权（供 composite_scores 与测试复用）。
+///
+/// 权重规则（人像 > 风景 > 宠物 > 其他）：
+/// - **人像**（`has_face` 且 `face` 有值）：人像美学(人脸分) 主导（0.55 + 眼部对焦 0.30 + 启发式 0.15；
+///   整图美学不参与——用户流程：五官/闭眼/眼部对焦/人像美学）
+/// - **风景**：美学 0.40 + 对焦 0.50 + 启发式 0.10（画质优先）
+/// - **宠物**：美学 0.45 + 对焦 0.45 + 启发式 0.10（均衡）
+/// - **其他**：原公式（美学 0.25 + 对焦 0.60 + 启发式 0.15）
+fn weighted_score(
+    aesthetic: Option<f32>,
+    focus: Option<f32>,
+    face: Option<f32>,
+    has_face: bool,
+    scene: crate::ai::scene::Scene,
+    heuristic: f32,
+) -> f32 {
+    let is_face_priority = has_face && face.is_some() && face.unwrap_or(0.0) > 0.0;
+    let (w_a, w_focus, w_face, w_h) = if is_face_priority {
+        (W_FACE_A, W_FACE_FOCUS, W_FACE_F, W_FACE_H)
+    } else if scene == crate::ai::scene::Scene::Landscape {
+        (W_LAND_A, W_LAND_FOCUS, 0.0, W_LAND_H)
+    } else if scene == crate::ai::scene::Scene::Pet {
+        (W_PET_A, W_PET_FOCUS, 0.0, W_PET_H)
+    } else {
+        (WEIGHT_AESTHETIC, WEIGHT_FOCUS, 0.0, WEIGHT_HEURISTIC)
+    };
+
+    let mut score = 0.0f32;
+    let mut weight_sum = 0.0f32;
+    if let Some(a) = aesthetic {
+        score += a * w_a;
+        weight_sum += w_a;
+    }
+    if let Some(fo) = focus {
+        score += fo * w_focus;
+        weight_sum += w_focus;
+    }
+    if let Some(f) = face.filter(|f| *f > 0.0) {
+        score += f * w_face;
+        weight_sum += w_face;
+    }
+    score += heuristic * w_h;
+    weight_sum += w_h;
+
+    if weight_sum > 0.0 {
+        (score / weight_sum).clamp(1.0, 10.0)
+    } else {
+        heuristic.clamp(1.0, 10.0)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn cuda_device_detection_does_not_crash() {
+        // 行为锁定：有 NVIDIA 驱动 → true；无驱动/无卡 → false（不 panic）。
+        // 本机结果取决于硬件，只验证可调用且与 nvidia-smi 存在性大体一致。
+        let detected = cuda_device_available();
+        log::info!("cuda_device_available = {}", detected);
+        let _ = detected;
+    }
+
+    #[test]
+    fn face_priority_boosts_face_score() {
+        use crate::ai::scene::Scene;
+        // 人脸 9.0 主导 0.55 权重 → 显著高于无脸场景
+        let with_face = weighted_score(Some(5.0), Some(5.0), Some(9.0), true, Scene::Portrait, 7.0);
+        let without_face = weighted_score(Some(5.0), Some(5.0), None, false, Scene::Other, 7.0);
+        assert!(
+            with_face > without_face,
+            "人脸优先图应得分更高: {} vs {}",
+            with_face,
+            without_face
+        );
+    }
+
+    #[test]
+    fn no_face_uses_focus_dominant() {
+        use crate::ai::scene::Scene;
+        // 无脸：对焦 0.6 权重主导
+        let s = weighted_score(Some(4.0), Some(8.0), None, false, Scene::Other, 7.0);
+        assert!((s - 6.7).abs() < 0.3, "无脸图对焦主导异常: {}", s);
+    }
+
+    #[test]
+    fn portrait_formula_face_dominant() {
+        use crate::ai::scene::Scene;
+        // 人像：0.55*9(人像美学) + 0.30*5(眼部对焦) + 0.15*7(启发式) = 7.5；整图美学不参与
+        let s = weighted_score(Some(5.0), Some(5.0), Some(9.0), true, Scene::Portrait, 7.0);
+        assert!((s - 7.5).abs() < 0.01, "人像图综合分异常: {}", s);
+    }
+
+    #[test]
+    fn landscape_weights_focus_higher() {
+        use crate::ai::scene::Scene;
+        // 风景：美学 0.40 + 对焦 0.50 + 启发式 0.10（对焦略高）
+        let s = weighted_score(Some(5.0), Some(8.0), None, false, Scene::Landscape, 7.0);
+        // 0.4*5 + 0.5*8 + 0.1*7 = 6.7
+        assert!((s - 6.7).abs() < 0.3, "风景图对焦权重异常: {}", s);
+    }
+
+    #[test]
+    fn pet_weights_balanced() {
+        use crate::ai::scene::Scene;
+        // 宠物：美学 0.45 + 对焦 0.45 + 启发式 0.10（均衡）
+        let s = weighted_score(Some(5.0), Some(5.0), None, false, Scene::Pet, 7.0);
+        // 0.45*5 + 0.45*5 + 0.1*7 = 5.2
+        assert!((s - 5.2).abs() < 0.3, "宠物图权重异常: {}", s);
+    }
+
+    #[test]
+    fn eye_penalty_is_continuous_and_open_untouched() {
+        // 明显睁眼（max(open) >= 0.5）→ 不降权（spec 字面公式会误伤，分段公式不罚）
+        assert_eq!(eye_penalty(1.0), 1.0);
+        assert_eq!(eye_penalty(0.6), 1.0);
+        // 阈值处平滑连续
+        assert!((eye_penalty(0.5) - 1.0).abs() < 1e-6);
+        // 接近阈值几乎不罚：0.49 → 0.99（旧硬阈值会直接 0.5）
+        assert!((eye_penalty(0.49) - 0.99).abs() < 1e-6);
+        // 半闭 → 0.75
+        assert!((eye_penalty(0.25) - 0.75).abs() < 1e-6);
+        // 全闭 → 0.5（与旧硬阈值极值一致）
+        assert!((eye_penalty(0.0) - 0.5).abs() < 1e-6);
+    }
+}
+
+/// L2 归一化（原地）。
+pub fn l2_normalize(v: &mut [f32]) {
+    let norm: f32 = v.iter().map(|x| x * x).sum::<f32>().sqrt();
+    if norm > 0.0 {
+        for x in v.iter_mut() {
+            *x /= norm;
+        }
+    }
+}
+
+/// 检测 onnxruntime 是否编译了 DirectML EP 支持。
+#[cfg(feature = "directml")]
+pub fn directml_available() -> bool {
+    DirectML::default().is_available().unwrap_or(false)
+}
+
+/// 未启用 directml feature 时，恒返回 false。
+#[cfg(not(feature = "directml"))]
+pub fn directml_available() -> bool {
+    false
+}
+
+/// 驱动级检测 NVIDIA GPU：动态加载 `nvcuda.dll`（装了 NVIDIA 驱动必有），
+/// 调 `cuInit(0)` + `cuDeviceGetCount` 确认设备数 ≥ 1。
+///
+/// 仅凭 `onnxruntime_providers_cuda.dll` 能加载不足以判定——系统 PATH 里有
+/// cudart/cudnn（如装过 PyTorch/OBS）时 EP DLL 会加载成功，但无 N 卡时推理
+/// 静默回退 CPU，后端标签就会误报 CUDA。
+#[cfg(feature = "cuda")]
+pub fn cuda_device_available() -> bool {
+    use std::ffi::c_void;
+
+    // 手写最小 FFI：LoadLibraryW / GetProcAddress（kernel32）
+    unsafe extern "system" {
+        fn LoadLibraryW(lpfilename: *const u16) -> *mut c_void;
+        fn GetProcAddress(hmodule: *mut c_void, lpprocname: *const u8) -> *mut c_void;
+        fn FreeLibrary(hlibmodule: *mut c_void) -> i32;
+    }
+
+    let name: Vec<u16> = "nvcuda.dll\0".encode_utf16().collect();
+    unsafe {
+        let lib = LoadLibraryW(name.as_ptr());
+        if lib.is_null() {
+            return false; // 无 NVIDIA 驱动
+        }
+        let result = (|| {
+            type CuInit = unsafe extern "system" fn(u32) -> i32;
+            type CuDeviceGetCount = unsafe extern "system" fn(*mut i32) -> i32;
+            let init: Option<CuInit> =
+                std::mem::transmute(GetProcAddress(lib, b"cuInit\0".as_ptr()));
+            let count: Option<CuDeviceGetCount> =
+                std::mem::transmute(GetProcAddress(lib, b"cuDeviceGetCount\0".as_ptr()));
+            let (Some(init), Some(count)) = (init, count) else {
+                return false;
+            };
+            if init(0) != 0 {
+                return false; // CUDA_ERROR 枚举非 0 即失败
+            }
+            let mut n: i32 = 0;
+            count(&mut n) == 0 && n >= 1
+        })();
+        FreeLibrary(lib);
+        result
+    }
+}
+
+/// 未启用 cuda feature 时，恒返回 false。
+#[cfg(not(feature = "cuda"))]
+pub fn cuda_device_available() -> bool {
+    false
+}
