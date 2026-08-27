@@ -175,8 +175,6 @@ pub struct SystemInfo {
     /// 是否检测到可用 GPU（DirectML / DirectX 12，覆盖 NVIDIA/AMD/Intel）
     pub gpu_available: bool,
     pub gpu_name: Option<String>,
-    /// CLIP 模型文件是否存在（去重核心）
-    pub clip_model_available: bool,
     /// 主技术质量模型（TOPIQ-NR）文件是否存在
     pub technical_model_available: bool,
     /// 应用数据目录

@@ -24,7 +24,7 @@ fn main() {
     // 优先使用源码树 models（cargo run --example 时 current_exe 在 target/debug/examples）
     let model_dir = {
         let manifest = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("models");
-        if manifest.join("clip-vit-b32-visual.onnx").exists() {
+        if manifest.join("topiq_nr.onnx").exists() {
             manifest
         } else {
             models_dir()
@@ -57,12 +57,9 @@ fn main() {
     }
 
     // 技术 / 美学
-    let clip_batch = preprocess::images_to_batch(&paths).expect("CLIP 预处理失败");
     let topiq_batch = preprocess::images_to_batch_topiq(&paths).expect("TOPIQ 预处理失败");
     let tech = if engine.has_topiq_nr() {
         engine.topiq_nr_scores(&topiq_batch).expect("TOPIQ-NR 推理失败")
-    } else if engine.has_clipiqa() {
-        engine.clipiqa_scores(&clip_batch).expect("CLIP-IQA 推理失败")
     } else {
         let nima_batch = preprocess::images_to_batch_nima(&paths).expect("NIMA 预处理失败");
         engine.nima_technical_scores(&nima_batch).expect("NIMA 推理失败")
@@ -70,8 +67,7 @@ fn main() {
     let aes = if engine.has_topiq_iia() {
         engine.topiq_iia_scores(&topiq_batch).expect("TOPIQ-IAA 推理失败")
     } else {
-        let embeds = engine.extract_embeddings(&clip_batch).expect("CLIP 推理失败");
-        engine.aesthetic_scores(&embeds).unwrap_or_default()
+        Vec::new() // CLIP/LAION 美学后备已移除（2026-08-27）
     };
 
     let widths: Vec<u32> = paths.iter().map(|p| image::image_dimensions(p).unwrap_or((0, 0)).0).collect();

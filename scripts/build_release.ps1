@@ -98,15 +98,11 @@ if (Test-Path $modelDir) {
     $destModels = Join-Path $pkgDir "models"
     New-Item -ItemType Directory -Path $destModels -Force | Out-Null
     $neededModels = @(
-        "clip-vit-b32-visual.onnx",   # CLIP_MODEL：图像语义向量（去重核心）
         "topiq_nr.onnx",              # TOPIQ_NR_MODEL：主技术质量评分图结构（ResNet50，KonIQ-10k，动态 batch 单文件）
         "topiq_iaa_res50.onnx",       # TOPIQ_IAA_MODEL：主美学评分（ResNet50，AVA，动态 batch 单文件）
-        "clipiqa_model.onnx",         # CLIP_IQA_MODEL：技术评分后备图结构（CLIP/RN50 零样本）
-        "clipiqa_model.onnx.data",    # CLIP_IQA_MODEL 外部权重（与 .onnx 配对，缺此文件 CLIP-IQA 加载失败）
         "nima-technical.onnx",        # NIMA_TECH_MODEL：技术评分二级后备
         "topiq_nr_face.onnx",         # TOPIQ_NR_FACE_MODEL：人脸专评（有人脸档最高权重）
-        "topiq_nr_face.onnx.data",    # TOPIQ_NR_FACE_MODEL 外部权重（与 .onnx 配对）
-        "aesthetic_linear.bin"        # AESTHETIC_WEIGHTS：美学评分后备权重（LAION 线性头）
+        "topiq_nr_face.onnx.data"     # TOPIQ_NR_FACE_MODEL 外部权重（与 .onnx 配对）
     )
     foreach ($m in $neededModels) {
         $src = Join-Path $modelDir $m

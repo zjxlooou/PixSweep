@@ -196,10 +196,6 @@ export function SettingsPanel({
               </span>
             </div>
             <div className="sys-row">
-              <span>CLIP 模型</span>
-              <span className={systemInfo.clip_model_available ? "ok" : "off"}>
-                {systemInfo.clip_model_available ? "已就绪" : "缺失"}
-              </span>
             </div>
             <div className="sys-row">
               <span>技术质量模型</span>

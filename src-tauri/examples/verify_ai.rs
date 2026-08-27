@@ -1,5 +1,5 @@
 //! 验证脚本：加载 AI 引擎，对一批真实图片打分，检查
-//! 1) CLIP-IQA 在 DirectML 上成功加载（has_clipiqa + backend）
+//! 1) TOPIQ-NR/IAA 在三级回退上成功加载（backend + has_topiq_*）
 //! 2) 同一张图两次打分一致（确定性，修复"同图不同分"）
 //! 3) 打印技术/美学/综合分，便于人工核对分布是否合理
 //!
@@ -32,7 +32,7 @@ fn main() {
     // current_exe 在 target/debug/examples 下，models_dir() 会回退到 AppData）。
     let model_dir = {
         let manifest = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("models");
-        if manifest.join("clip-vit-b32-visual.onnx").exists() {
+        if manifest.join("topiq_nr.onnx").exists() {
             manifest
         } else {
             models_dir()
@@ -47,11 +47,10 @@ fn main() {
         }
     };
     println!(
-        "[verify] 后端: {} | TOPIQ-NR 可用: {} | TOPIQ-IAA 可用: {} | CLIP-IQA 可用: {}",
+        "[verify] 后端: {} | TOPIQ-NR 可用: {} | TOPIQ-IAA 可用: {}",
         engine.backend().label(),
         engine.has_topiq_nr(),
         engine.has_topiq_iia(),
-        engine.has_clipiqa(),
     );
 
     // 收集可解码的图片（同时校验 EXIF Orientation 解码不报错）
@@ -170,9 +169,8 @@ fn main() {
     // 双缓冲流水线计时（性能基准 seam）：同一目录 + 同一 N 下对比优化前后。
     // wall 含重叠，通常 < prep + infer —— 解码隐藏在 GPU 推理期间即优化生效。
     println!(
-        "\n[verify] 计时(双缓冲流水线): 预处理(与推理重叠) TOPIQ={:.2}s CLIP={:.2}s NIMA={:.2}s 推理={:.2}s wall={:.2}s 每张≈{:.0}ms 对焦+综合={:.2}s",
+        "\n[verify] 计时(双缓冲流水线): 预处理(与推理重叠) TOPIQ={:.2}s NIMA={:.2}s 推理={:.2}s wall={:.2}s 每张≈{:.0}ms 对焦+综合={:.2}s",
         timing.prep_topiq_sec,
-        timing.prep_clip_sec,
         timing.prep_nima_sec,
         timing.infer_sec,
         timing.wall_sec,

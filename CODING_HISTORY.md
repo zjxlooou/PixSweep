@@ -184,6 +184,38 @@
 
 ---
 
+### 2026-08-27（晚）— FP16 化主力模型 + 移除 CLIP/LAION 后备（体积 -72%）
+
+**需求**：四目标——体积、性能、人像美学可靠性、非人像美学可靠性。先建客观评测基准再动生产：
+Wikimedia Commons 4 类（人像/狗/风景/食物）× 合成降级（blur/jpeg/quarter/dark）= 357 张「原图>降级」有序对，
+以降级敏感度/Cohen's d/单调性/fp32↔fp16 一致性为无标注可靠性的客观代理。评测在 DirectML GPU 上跑
+（`.scratch/model-research/`，REPORT.md 有全表）。
+
+**落地改动**：
+- **三主力 FP16**（onnxconverter_common，IO 保持 FP32，引擎零改动）：topiq_nr 177→88.7MB、
+  topiq_iaa 277→138.8MB、topiq_nr_face 178→89.8MB；与 fp32 的 ρ≥0.9998、降级敏感度逐位一致、
+  DML 上更快（29ms vs 38ms 等）。注意坑：转换默认写外部 `.data` 且引用路径跟随 onnx 文件名，
+  生产重命名必须内嵌单文件（`convert_model_from_external_data`）。
+- **移除 CLIP/LAION 后备**（-489MB）：clip-vit-b32-visual.onnx、clipiqa_model.onnx+.data、
+  aesthetic_linear.bin 归档至 `models-archive/clip-removal-20260827/`。engine.rs 的 clip_session/
+  clipiqa_session/aesthetic_head 及 extract_embeddings/aesthetic_scores/clipiqa_scores/has_clipiqa
+  全部删除；`AestheticHead` 移除；技术后备链变为 TOPIQ-NR → NIMA，美学无后备；`backend` 字段改为
+  「首个成功加载的评分模型会话的后端」。前端/TS/MCP 的 `clip_model_available` 字段删除。
+- 发货模型体积 ~1.12GB → **~310MB（-72%）**。
+
+**新架构候选结论**：hyperiqa（KonIQ，55MB fp16）全变体敏感度第一（d=1.20）但 512² 输入 GPU 118ms/张
+且人像分数系统性偏低——适合「非人像场景的质量辅助信号」，未接入；maniqa/nima(AVA) 因 torch 2.13
+导出层兼容问题止损未采用。
+
+**目标3 发现（未落地，待第二轮）**：nr_face 对欠曝人像不扣分（盲区），而 topiq_nr 直接打人脸 crop
+对 blur/jpeg/quarter 全部强敏感（+0.21~0.28）；两者 ρ=0.59 互补 → 可用 nr-on-face 作为 nr_face 的
+互补/否决信号。
+
+**回归**：cargo test 39 全过、tsc/前端构建过、verify_labeled 6/7 与 fp32 基线一致（组4 已知不可解），
+综合分仅 fp16 尾数差（≤0.01）。
+
+---
+
 ## 评分模型演进（重要）
 
 | 阶段 | 技术评分 | 美学评分 | 时间 |

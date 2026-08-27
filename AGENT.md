@@ -70,7 +70,7 @@ cargo run --example verify_scene -- <目录>                   # 场景分类
 
 - `commands.rs` — IPC 命令层，扫描编排，调用 `composite_scores` 得到评分送入 `build_groups`
 - `ai/engine.rs` — 核心：加载全部 ONNX session（三级回退 CUDA→DirectML→CPU）、`composite_scores` 组合评分（场景权重重 + 闭眼惩罚）
-- `ai/clip.rs` / `ai/topiq.rs` / `ai/topiq_face.rs` / `ai/nima.rs` — 各推理封装；`ai/preprocess.rs` 图像预处理
+- `ai/topiq.rs` / `ai/topiq_face.rs` / `ai/nima.rs` — 各推理封装；`ai/preprocess.rs` 图像预处理
 - `ai/insightface.rs` — 人脸检测（buffalo_l `det_10g` 输入名 `input.1` + 手动 NMS）+ `align_face`（5 关键点→112 模板）
 - `ai/eye.rs` — 闭眼检测双信号：MediaPipe 脸网格（垂目开度，主信号）+ OCEC（眨眼否决），网格虹膜中心回喂 OCEC 做 ROI
 - `ai/scene.rs` + `ai/scene_map.rs` — MobileNetV3 场景分类（人像/风景/宠物/其他）
@@ -95,9 +95,9 @@ cargo run --example verify_scene -- <目录>                   # 场景分类
 ### 推理后端分配
 
 - **三级回退链 CUDA→DirectML→CPU** 用于所有模型（CUDA 仅在检测到真实 NVIDIA GPU 时启用，见 `build_session`）。
-- **CLIP-IQA+ 强制 CPU EP**（`build_session(force_cpu=true)`，其 `Reshape` op 与 DirectML 不兼容，返回 E_INVALIDARG）。
 - 会话统一 `with_parallel_execution(false)` + `with_memory_pattern(false)` + `with_intra_threads(1)` 保证评分确定性（否则同一张图分数时高时低）。
 - 模型**缺失不报错**，仅 `log::warn` 并跳过对应能力（真机测要核对日志）。
+- CLIP/LAION 美学后备已移除（2026-08-27）：技术后备链 = TOPIQ-NR → NIMA；美学无后备。
 
 ### 易变签名
 
@@ -105,10 +105,11 @@ cargo run --example verify_scene -- <目录>                   # 场景分类
 
 ## 模型与打包
 
-- 模型在 `src-tauri/models/`（~960MB：通用评分模型 + `insightface/` + `scene/` + `eye/` 子目录），**不入 git，不可删**（删除需重新下载），通过发布 zip 分发。文件清单以磁盘为准（`ls src-tauri/models/`）；`models/eye/face_landmarker.onnx`（4.6MB 脸网格）是可选信号，缺失自动退化为仅 OCEC。
-- **外部数据配对文件坑**：部分模型是 `*.onnx` + `*.onnx.data` 成对存放（当前为 `clipiqa_model`、`topiq_nr_face`、`scene/mobilenet_v3_large`）。按扩展名扫描会漏 `.data`——打包白名单 `scripts/build_release.ps1` 的 `$neededModels` 必须显式列出全部 `.onnx.data`，否则发布版静默回退到后备模型。
+- 模型在 `src-tauri/models/`（**FP16 精度**，~310MB 通用评分模型 + `insightface/` + `scene/` + `eye/` 子目录），**不入 git，不可删**（删除需重新下载），通过发布 zip 分发。文件清单以磁盘为准（`ls src-tauri/models/`）；`models/eye/face_landmarker.onnx`（4.6MB 脸网格）是可选信号，缺失自动退化为仅 OCEC。
+- **外部数据配对文件坑**：部分模型是 `*.onnx` + `*.onnx.data` 成对存放（当前仅 `topiq_nr_face`）。**ORT 校验 .data 引用路径跟随 onnx 文件名**——重命名 onnx 必须同步改内部引用或干脆内嵌为单文件（`onnx.external_data_helper.convert_model_from_external_data`）。打包白名单 `scripts/build_release.ps1` 的 `$neededModels` 必须显式列出全部 `.onnx.data`，否则发布版静默缺件。
+- **精度**：2026-08-27 起三主力模型为 FP16（IO 保持 FP32，引擎零改动）。实测与 FP32 的 ρ≥0.9998、GPU 更快；**CPU EP 无原生 fp16 核会慢数倍，性能结论只在 GPU 上有效**。
 - **batch 维度**：TOPIQ-NR/IAA 为**动态 batch**（整批一次推理）；其余评分模型仍 **fix batch=1**，必须逐张推理（批量输入静默失败）。
-- `models-archive/` 存弃用模型存档，不参与打包、不入库。
+- `models-archive/` 存弃用模型存档（MUSIQ、CLIP 对、FP32 三巨头），不参与打包、不入库。
 - 临时 Python 模型验证脚本用完即删，**不要 `git add` 进提交**。
 
 ## 数据安全
@@ -151,6 +152,8 @@ OCEC（训练数据=眨眼式闭眼）对「垂目/低头看」判全开（任�
 | 决策 | 结论 | 原因 |
 |------|------|------|
 | 推理后端 | CUDA→DirectML→CPU 三级回退 | POC 实测 CUDA 最快（~4× CPU）；但 EP DLL 能加载 ≠ 有 NVIDIA GPU，需真实检测；不绑定单一硬件生态 |
+| 权重精度 | 主力三模型 FP16（IO 保持 FP32） | 实测 ρ≥0.9998、体积减半、GPU 更快；CPU EP 慢数倍故仅 GPU 有效 |
+| CLIP/LAION 后备 | 移除（2026-08-27） | 主模型健康时零参与评分；-489MB；技术后备保留 NIMA，美学无后备 |
 | 存储 | JSON（非 SQLite） | 避免 C 编译依赖 |
 | 技术评分主模型 | TOPIQ-NR（非 CLIP-IQA+） | KonIQ SRCC 0.930 > 0.885 |
 | 美学评分主模型 | TOPIQ-IAA（非 LAION V1） | AVA SRCC 0.791 > 0.665 |

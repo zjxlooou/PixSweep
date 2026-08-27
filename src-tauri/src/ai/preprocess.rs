@@ -3,13 +3,9 @@
 use ndarray::{Array, Ix4};
 use rayon::prelude::*;
 
-/// CLIP / NIMA 模型的标准输入尺寸。
+/// NIMA 模型的标准输入尺寸。
 pub const INPUT_SIZE: u32 = 224;
 
-/// ImageNet 归一化均值（RGB）——CLIP 使用。
-pub const MEAN: [f32; 3] = [0.48145466, 0.4578275, 0.40821073];
-/// ImageNet 归一化标准差（RGB）——CLIP 使用。
-pub const STD: [f32; 3] = [0.26862954, 0.26130258, 0.27577711];
 
 /// ImageNet 归一化均值（RGB）——NIMA / MobileNet / TOPIQ 使用。
 pub const MEAN_MOBILENET: [f32; 3] = [0.485, 0.456, 0.406];
@@ -70,12 +66,6 @@ fn image_to_tensor_layout(
     Ok(t)
 }
 
-/// 将图片路径解码并预处理为 `[1, 3, 224, 224]` 的 CHW float tensor。
-///
-/// 步骤：解码（含 EXIF Orientation 旋转）→ 居中裁剪 → resize 224×224 → RGB → 归一化 → CHW。
-pub fn image_to_tensor(path: &str) -> anyhow::Result<Array<f32, Ix4>> {
-    image_to_tensor_layout(path, INPUT_SIZE, true, &MEAN, &STD)
-}
 
 /// 批量预处理：每张图独立解码/裁剪/resize/归一化，rayon 并行跑（解码是 CPU 瓶颈，
 /// 并行后 GPU 等数据的时间显著缩短），再按原顺序组装 batch tensor。
@@ -110,16 +100,10 @@ fn images_to_batch_layout(
     Ok(batch)
 }
 
-/// 将多张图片预处理为 `[N, 3, 224, 224]` 的批量 tensor。
-///
-/// `paths` 长度必须等于 `n`。返回的 tensor 第一维为 `n`。
-pub fn images_to_batch(paths: &[String]) -> anyhow::Result<Array<f32, Ix4>> {
-    images_to_batch_layout(paths, INPUT_SIZE, true, &MEAN, &STD)
-}
 
 /// 将多张图片预处理为 NIMA（MobileNet）所需的 `[N, 224, 224, 3]` NHWC 批量 tensor。
 ///
-/// 与 CLIP 不同：NIMA 输入是 NHWC 布局，使用 MobileNet 的归一化参数。
+/// NIMA 输入是 NHWC 布局，使用 MobileNet 的归一化参数。
 pub fn images_to_batch_nima(paths: &[String]) -> anyhow::Result<Array<f32, Ix4>> {
     images_to_batch_layout(paths, INPUT_SIZE, false, &MEAN_MOBILENET, &STD_MOBILENET)
 }

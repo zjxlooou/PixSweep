@@ -7,13 +7,11 @@
 //! 运行时按顺序探测，session 创建时自动注入 EP 列表（失败则降级）。
 //!
 //! 评分体系（双维度）：
-//! - **技术评分**：TOPIQ-NR（ResNet50，KonIQ-10k，主用）→ CLIP-IQA+（CPU EP 后备）→ NIMA（二级后备）
-//! - **美学评分**：TOPIQ-IAA（ResNet50，AVA，主用）→ LAION Aesthetics V1 线性头（依赖 CLIP embedding，后备）
+//! - **技术评分**：TOPIQ-NR（ResNet50，KonIQ-10k，主用）→ NIMA（MobileNetV2，二级后备）
+//! - **美学评分**：TOPIQ-IAA（ResNet50，AVA，主用）；LAION/CLIP 后备已于 2026-08-27 移除
 //! 综合评分 = 美学 × w_a + 技术 × w_t + 启发式，用于组内挑选最佳照片。
 //!
-//! 去重核心：CLIP ViT-B/32 提取 embedding 做相似度聚类（独立于评分体系，始终保留）。
 
-use crate::ai::clip::{CLIP_EMBEDDING_DIM, INPUT_NAME as CLIP_INPUT, OUTPUT_NAME as CLIP_OUTPUT};
 use crate::ai::nima::{INPUT_NAME as NIMA_INPUT, OUTPUT_NAME as NIMA_OUTPUT};
 use crate::ai::topiq::{
     IAA_OUTPUT_NAME as TOPIQ_IAA_OUTPUT, INPUT_NAME as TOPIQ_INPUT,
@@ -24,16 +22,8 @@ use ort::ep::{CPU, DirectML, ExecutionProvider};
 use ort::session::builder::{GraphOptimizationLevel, SessionBuilder};
 use ort::session::Session;
 
-/// CLIP 模型文件名。
-pub const CLIP_MODEL: &str = "clip-vit-b32-visual.onnx";
 /// NIMA 技术质量模型文件名（MobileNet 224×224，10-bin MOS 分布）。
 pub const NIMA_TECH_MODEL: &str = "nima-technical.onnx";
-/// CLIP-IQA+ 技术质量模型文件名（CLIP/RN50 零样本质量评估，输出 0~1）。
-pub const CLIP_IQA_MODEL: &str = "clipiqa_model.onnx";
-/// CLIP-IQA 模型输入张量名称（86Cao/IQA-ONNX-Models 导出约定）。
-pub const CLIP_IQA_INPUT: &str = "input";
-/// LAION 美学线性头权重文件（原始 .pth 导出的二进制）。
-pub const AESTHETIC_WEIGHTS: &str = "aesthetic_linear.bin";
 /// TOPIQ-NR 技术质量模型文件名（ResNet50，KonIQ-10k，输出 0~1）。
 pub const TOPIQ_NR_MODEL: &str = "topiq_nr.onnx";
 /// TOPIQ-IAA 美学模型文件名（ResNet50，AVA，输出 10-bin softmax）。
@@ -86,60 +76,12 @@ impl GpuBackend {
     }
 }
 
-/// LAION 美学线性头（512 维 → 标量），加载自导出的二进制权重。
-pub struct AestheticHead {
-    weight: Vec<f32>, // 512 个
-    bias: f32,
-}
 
-impl AestheticHead {
-    /// 从二进制文件加载权重：前 512 个 f32 为 weight，最后一个 f32 为 bias。
-    pub fn load(path: &std::path::Path) -> anyhow::Result<Self> {
-        let bytes = std::fs::read(path)
-            .map_err(|e| anyhow::anyhow!("读取美学权重失败 {}: {}", path.display(), e))?;
-        let expected = (CLIP_EMBEDDING_DIM + 1) * 4;
-        if bytes.len() < expected {
-            anyhow::bail!(
-                "美学权重文件大小异常 {}: 期望 >= {} 字节, 实际 {}",
-                path.display(),
-                expected,
-                bytes.len()
-            );
-        }
-        let mut weight = Vec::with_capacity(CLIP_EMBEDDING_DIM);
-        for i in 0..CLIP_EMBEDDING_DIM {
-            weight.push(f32::from_le_bytes(bytes[i * 4..i * 4 + 4].try_into().unwrap()));
-        }
-        let bias_bytes: [u8; 4] = bytes[CLIP_EMBEDDING_DIM * 4..CLIP_EMBEDDING_DIM * 4 + 4]
-            .try_into()
-            .unwrap();
-        let bias = f32::from_le_bytes(bias_bytes);
-        Ok(Self { weight, bias })
-    }
-
-    /// 对已 L2 归一化的 CLIP embedding 计算美学分（1.0~10.0）。
-    pub fn predict(&self, embedding: &[f32]) -> f32 {
-        let dot: f32 = self
-            .weight
-            .iter()
-            .zip(embedding.iter())
-            .map(|(w, x)| w * x)
-            .sum();
-        let logit = dot + self.bias;
-        // sigmoid 映射到 (0,1)，再映射到 1~10
-        let s = 1.0 / (1.0 + (-logit).exp());
-        1.0 + s * 9.0
-    }
-}
-
-/// AI 推理引擎，持有 CLIP（去重）+ TOPIQ-NR/IAA（主评分）+ CLIP-IQA/NIMA（后备）+ 美学线性头。
+/// AI 推理引擎，持有 TOPIQ-NR/IAA（主评分）+ NIMA（技术后备）+ 人脸/场景/闭眼。
 pub struct AiEngine {
-    clip_session: parking_lot::Mutex<Session>,
     topiq_nr_session: Option<parking_lot::Mutex<Session>>,
     topiq_iia_session: Option<parking_lot::Mutex<Session>>,
-    clipiqa_session: Option<parking_lot::Mutex<Session>>,
     nima_tech_session: Option<parking_lot::Mutex<Session>>,
-    aesthetic_head: Option<AestheticHead>,
     /// InsightFace 人脸检测（可选）：存在 buffalo_l 模型时加载
     face_det: Option<crate::ai::insightface::InsightFaceEngine>,
     /// TOPIQ-NR-Face 人脸专评 session（可选）：模型存在时加载
@@ -153,45 +95,22 @@ pub struct AiEngine {
 
 impl AiEngine {
     /// 初始化引擎：优先 DirectML，失败回退 CPU。
-    /// 加载顺序：CLIP（必需）→ NIMA 技术质量（可选）→ 美学头（可选）。
+    /// 加载顺序：TOPIQ-NR/IAA（主）→ NIMA 技术质量（后备，可选）。
     pub fn new(model_dir: &std::path::Path) -> anyhow::Result<Self> {
-        let clip_path = model_dir.join(CLIP_MODEL);
         let tech_path = model_dir.join(NIMA_TECH_MODEL);
-        let aesthetic_path = model_dir.join(AESTHETIC_WEIGHTS);
 
         log::info!("AI 引擎初始化，模型目录: {}", model_dir.display());
         log::info!("DirectML 编译支持: {}", directml_available());
-        if !clip_path.exists() {
-            anyhow::bail!("CLIP 模型不存在: {}", clip_path.display());
-        }
-        log::info!("CLIP 模型存在: {}", clip_path.display());
 
-        let (clip_session, backend) = Self::build_session(&clip_path, false)?;
-        let clip_session = parking_lot::Mutex::new(clip_session);
-        log::info!("CLIP 会话就绪，推理后端: {}", backend.label());
+        // 引擎后端 = 首个成功加载的评分模型会话所用后端（无模型可用时为 CPU）
+        let mut backend = GpuBackend::Cpu;
 
-        // 美学线性头（可选）：缺失时无美学分，用启发式
-        let aesthetic_head = if aesthetic_path.exists() {
-            match AestheticHead::load(&aesthetic_path) {
-                Ok(h) => {
-                    log::info!("LAION 美学头加载成功: {}", aesthetic_path.display());
-                    Some(h)
-                }
-                Err(e) => {
-                    log::warn!("美学头加载失败，使用启发式评分: {}", e);
-                    None
-                }
-            }
-        } else {
-            log::warn!("美学头不存在，使用启发式评分: {}", aesthetic_path.display());
-            None
-        };
-
-        // NIMA 技术质量模型（可选）：作为 CLIP-IQA 不可用时的兼容后备
+        // NIMA 技术质量模型（可选）：TOPIQ-NR 不可用时的后备
         let nima_tech_session = if tech_path.exists() {
             log::info!("NIMA 技术模型存在: {}", tech_path.display());
             match Self::build_session(&tech_path, false) {
                 Ok((s, be)) => {
+                    backend = be;
                     log::info!("NIMA 技术会话就绪，推理后端: {}", be.label());
                     Some(parking_lot::Mutex::new(s))
                 }
@@ -205,45 +124,23 @@ impl AiEngine {
             None
         };
 
-        // CLIP-IQA+ 技术质量模型（可选，主用）：缺失时回退 NIMA
-        let clipiqa_path = model_dir.join(CLIP_IQA_MODEL);
-        let clipiqa_session = if clipiqa_path.exists() {
-            log::info!("CLIP-IQA 模型存在: {}", clipiqa_path.display());
-            log::info!("CLIP-IQA 强制使用 CPU EP（DirectML 对 Reshape op 不兼容）");
-            match Self::build_session(&clipiqa_path, true) {
-                Ok((s, be)) => {
-                    log::info!("CLIP-IQA 会话就绪，推理后端: {}", be.label());
-                    Some(parking_lot::Mutex::new(s))
-                }
-                Err(e) => {
-                    log::warn!("CLIP-IQA 模型加载失败，回退 NIMA 技术评分: {}", e);
-                    None
-                }
-            }
-        } else {
-            log::warn!(
-                "CLIP-IQA 模型不存在，使用 NIMA 技术评分: {}",
-                clipiqa_path.display()
-            );
-            None
-        };
-
         // TOPIQ-NR 技术质量模型（主用，ResNet50）：优先 DirectML，失败回退 CPU
         let topiq_nr_path = model_dir.join(TOPIQ_NR_MODEL);
         let topiq_nr_session = if topiq_nr_path.exists() {
             log::info!("TOPIQ-NR 模型存在: {}", topiq_nr_path.display());
             match Self::build_session(&topiq_nr_path, false) {
                 Ok((s, be)) => {
+                    backend = be;
                     log::info!("TOPIQ-NR 会话就绪，推理后端: {}", be.label());
                     Some(parking_lot::Mutex::new(s))
                 }
                 Err(e) => {
-                    log::warn!("TOPIQ-NR 模型加载失败，回退 CLIP-IQA/NIMA: {}", e);
+                    log::warn!("TOPIQ-NR 模型加载失败，回退 NIMA: {}", e);
                     None
                 }
             }
         } else {
-            log::warn!("TOPIQ-NR 模型不存在，使用 CLIP-IQA/NIMA 技术评分");
+            log::warn!("TOPIQ-NR 模型不存在，使用 NIMA 技术评分");
             None
         };
 
@@ -253,16 +150,17 @@ impl AiEngine {
             log::info!("TOPIQ-IAA 模型存在: {}", topiq_iia_path.display());
             match Self::build_session(&topiq_iia_path, false) {
                 Ok((s, be)) => {
+                    backend = be;
                     log::info!("TOPIQ-IAA 会话就绪，推理后端: {}", be.label());
                     Some(parking_lot::Mutex::new(s))
                 }
                 Err(e) => {
-                    log::warn!("TOPIQ-IAA 模型加载失败，回退 LAION 美学头: {}", e);
+                    log::warn!("TOPIQ-IAA 模型加载失败，无美学后备: {}", e);
                     None
                 }
             }
         } else {
-            log::warn!("TOPIQ-IAA 模型不存在，使用 LAION 美学头");
+            log::warn!("TOPIQ-IAA 模型不存在，无美学评分");
             None
         };
 
@@ -346,12 +244,9 @@ impl AiEngine {
         };
 
         Ok(Self {
-            clip_session,
             topiq_nr_session,
             topiq_iia_session,
-            clipiqa_session,
             nima_tech_session,
-            aesthetic_head,
             face_det,
             face_session,
             scene_session,
@@ -363,7 +258,7 @@ impl AiEngine {
     /// 构建会话：三级回退（CUDA → DirectML → CPU）。
     ///
     /// `force_cpu=true` 时跳过 GPU：某些模型的个别 op 在 GPU 跑期会报错
-    /// （例如 CLIP-IQA+ 的 `Reshape` 节点，DirectML 返回 E_INVALIDARG），
+    /// （CLIP-IQA+ 的 `Reshape` 节点曾因 DirectML 返回 E_INVALIDARG 而强制 CPU；
     /// 此时直接用 CPU EP 最稳妥——模型能正常加载且推理确定。
     pub(super) fn build_session(
         path: &std::path::Path,
@@ -801,39 +696,6 @@ impl AiEngine {
         (scores, has_face)
     }
 
-    /// 批量提取 CLIP embedding（L2 归一化后的 512 维向量）。
-    ///
-    /// 输入 `batch` 形状为 `[N, 3, 224, 224]`。
-    pub fn extract_embeddings(&self, batch: &Array4<f32>) -> anyhow::Result<Vec<Vec<f32>>> {
-        let tensor = ort::value::Tensor::from_array(batch.clone())?;
-        let mut session = self.clip_session.lock();
-        let outputs = session.run(ort::inputs![CLIP_INPUT => tensor])?;
-
-        let embeds = outputs[CLIP_OUTPUT].try_extract_array::<f32>()?;
-        let n = embeds.shape()[0];
-
-        let mut result = Vec::with_capacity(n);
-        for i in 0..n {
-            let mut vec: Vec<f32> = embeds.slice(ndarray::s![i, ..]).iter().copied().collect();
-            l2_normalize(&mut vec);
-            result.push(vec);
-        }
-
-        Ok(result)
-    }
-
-    /// 用 LAION 美学头对 CLIP embedding 打分（1.0~10.0）。
-    /// 美学头缺失时返回 None。
-    pub fn aesthetic_scores(&self, embeddings: &[Vec<f32>]) -> Option<Vec<f32>> {
-        let head = self.aesthetic_head.as_ref()?;
-        Some(embeddings.iter().map(|e| head.predict(e)).collect())
-    }
-
-    /// 是否启用了 CLIP-IQA 主技术评分模型。
-    pub fn has_clipiqa(&self) -> bool {
-        self.clipiqa_session.is_some()
-    }
-
     /// 是否启用了 TOPIQ-NR 主技术评分模型（优先级最高）。
     pub fn has_topiq_nr(&self) -> bool {
         self.topiq_nr_session.is_some()
@@ -893,29 +755,7 @@ impl AiEngine {
     }
 
 
-    /// CLIP-IQA+ 技术质量评分（CLIP/RN50 零样本，输出 0~1）。
-    ///
-    /// 输入 `batch` 形状为 `[N, 3, 224, 224]`（CHW + CLIP 归一化，复用 `images_to_batch`）。
-    /// 输出映射到 1~10（线性 `1 + v*9`）。
-    pub fn clipiqa_scores(&self, batch: &Array4<f32>) -> anyhow::Result<Vec<f32>> {
-        let Some(clipiqa) = &self.clipiqa_session else {
-            anyhow::bail!("CLIP-IQA 会话未初始化");
-        };
-        let tensor = ort::value::Tensor::from_array(batch.clone())?;
-        let mut session = clipiqa.lock();
-        let outputs = session.run(ort::inputs![CLIP_IQA_INPUT => tensor])?;
-        let raw = outputs[0].try_extract_array::<f32>()?;
-        // 输出形状可能是 [N] 或 [N, 1]，先摊平再逐张映射
-        let raw_vec: Vec<f32> = raw.iter().copied().collect();
-        let mut scores = Vec::with_capacity(raw_vec.len());
-        for v in raw_vec {
-            // CLIP-IQA+ 输出已 sigmoid 到 [0,1]；越界做 clamp 保护
-            scores.push(1.0 + v.clamp(0.0, 1.0) * 9.0);
-        }
-        Ok(scores)
-    }
-
-    /// NIMA 技术质量评分（MobileNet 224×224，10-bin MOS 分布），作为 CLIP-IQA 的后备。
+    /// NIMA 技术质量评分（MobileNet 224×224，10-bin MOS 分布），技术后备。
     ///
     /// 输入 `batch` 形状为 `[N, 224, 224, 3]`（NHWC + MobileNet 归一化）。
     /// 输出为 1~10 范围的浮点分数（10-bin 分布的加权平均）。
@@ -946,7 +786,7 @@ impl AiEngine {
     ///   （美学 0.20 + 技术 0.20 + 人脸 0.45 + 启发式 0.15）——人像优先
     /// - **无人脸**：原公式（美学 0.25 + 技术 0.60 + 启发式 0.15）
     ///
-    /// `aesthetic`: CLIP/TOPIQ-IAA 美学分数组（可选）
+    /// `aesthetic`: TOPIQ-IAA 美学分数组（可选）
     /// `focus`: 每张图对焦分（可选，1~10；人像=眼部对焦，非人像=整图对焦）
     /// `face`: TOPIQ-NR-Face 人脸专评分数组（可选，1~10）
     /// `has_face`: 是否检测到人脸
@@ -1008,8 +848,6 @@ impl AiEngine {
 pub struct PipelineTiming {
     /// TOPIQ 预处理总耗时（各批求和，与推理重叠执行）。
     pub prep_topiq_sec: f64,
-    /// CLIP 预处理总耗时（各批求和）。
-    pub prep_clip_sec: f64,
     /// NIMA 预处理总耗时（各批求和）。
     pub prep_nima_sec: f64,
     /// consumer 端推理总耗时（各批求和）。
@@ -1019,16 +857,15 @@ pub struct PipelineTiming {
 }
 
 impl PipelineTiming {
-    /// 预处理总耗时（三种模型的求和）。
+    /// 预处理总耗时（各模型预处理求和）。
     pub fn prep_sec(&self) -> f64 {
-        self.prep_topiq_sec + self.prep_clip_sec + self.prep_nima_sec
+        self.prep_topiq_sec + self.prep_nima_sec
     }
 }
 
 /// 双缓冲流水线中一批图片的预处理 tensor（channel 传输单元）。
 struct BatchTensors {
     topiq: Option<Array4<f32>>,
-    clip: Option<Array4<f32>>,
     nima: Option<Array4<f32>>,
 }
 
@@ -1036,7 +873,6 @@ impl Default for BatchTensors {
     fn default() -> Self {
         Self {
             topiq: None,
-            clip: None,
             nima: None,
         }
     }
@@ -1049,8 +885,8 @@ impl Default for BatchTensors {
 ///
 /// 批内顺序、模型调用顺序、session 串行语义不变 → 分数确定可复现。
 ///
-/// - 美学分：TOPIQ-IAA 优先，否则 CLIP embedding → LAION 头。
-/// - 技术分：TOPIQ-NR 优先，否则 CLIP-IQA+，否则 NIMA。
+/// - 美学分：TOPIQ-IAA（LAION/CLIP 后备已移除）。
+/// - 技术分：TOPIQ-NR 优先，否则 NIMA。
 /// - 无对应模型 / 预处理失败 → 该图对应分值为 `None`。
 ///
 /// `progress(done, total)` 每批开始前调用（供进度条）。
@@ -1070,11 +906,9 @@ pub fn score_batch_scores(
     let chunks: Vec<&[String]> = paths.chunks(batch_size.max(1)).collect();
 
     let need_topiq = engine.has_topiq_nr() || engine.has_topiq_iia();
-    let need_clip = !engine.has_topiq_iia() || (engine.has_clipiqa() && !engine.has_topiq_nr());
-    let need_nima = !engine.has_topiq_nr() && !engine.has_clipiqa();
+    let need_nima = !engine.has_topiq_nr();
 
     let mut prep_topiq_sec = 0.0f64;
-    let mut prep_clip_sec = 0.0f64;
     let mut prep_nima_sec = 0.0f64;
     let mut infer_sec = 0.0f64;
     let wall = std::time::Instant::now();
@@ -1092,14 +926,6 @@ pub fn score_batch_scores(
                         Err(e) => log::warn!("TOPIQ 预处理失败: {}", e),
                     }
                     prep_topiq_sec += t0.elapsed().as_secs_f64();
-                }
-                if need_clip {
-                    let t0 = std::time::Instant::now();
-                    match crate::ai::preprocess::images_to_batch(chunk) {
-                        Ok(v) => b.clip = Some(v),
-                        Err(e) => log::warn!("CLIP 预处理失败: {}", e),
-                    }
-                    prep_clip_sec += t0.elapsed().as_secs_f64();
                 }
                 if need_nima {
                     let t0 = std::time::Instant::now();
@@ -1129,17 +955,7 @@ pub fn score_batch_scores(
                     .as_ref()
                     .map(|t| engine.topiq_iia_scores(t).unwrap_or_default())
             } else {
-                let Some(clip) = b.clip.as_ref() else {
-                    continue; // 该批无法评分（无 CLIP 预处理结果）
-                };
-                let embeddings = match engine.extract_embeddings(clip) {
-                    Ok(e) => e,
-                    Err(err) => {
-                        log::warn!("CLIP 推理失败: {}", err);
-                        continue;
-                    }
-                };
-                engine.aesthetic_scores(&embeddings)
+                None // 美学后备（LAION/CLIP）已随 CLIP 移除
             };
 
             let tech_scores: Vec<f32> = if engine.has_topiq_nr() {
@@ -1147,11 +963,6 @@ pub fn score_batch_scores(
                     .as_ref()
                     .map(|t| engine.topiq_nr_scores(t).unwrap_or_default())
                     .unwrap_or_default()
-            } else if engine.has_clipiqa() {
-                match b.clip.as_ref() {
-                    Some(c) => engine.clipiqa_scores(c).unwrap_or_default(),
-                    None => Vec::new(),
-                }
             } else {
                 match b.nima.as_ref() {
                     Some(nm) => engine.nima_technical_scores(nm).unwrap_or_default(),
@@ -1170,7 +981,6 @@ pub fn score_batch_scores(
 
     let timing = PipelineTiming {
         prep_topiq_sec,
-        prep_clip_sec,
         prep_nima_sec,
         infer_sec,
         wall_sec: wall.elapsed().as_secs_f64(),
@@ -1320,16 +1130,6 @@ mod tests {
         assert!((eye_penalty(0.25) - 0.75).abs() < 1e-6);
         // 全闭 → 0.5（与旧硬阈值极值一致）
         assert!((eye_penalty(0.0) - 0.5).abs() < 1e-6);
-    }
-}
-
-/// L2 归一化（原地）。
-pub fn l2_normalize(v: &mut [f32]) {
-    let norm: f32 = v.iter().map(|x| x * x).sum::<f32>().sqrt();
-    if norm > 0.0 {
-        for x in v.iter_mut() {
-            *x /= norm;
-        }
     }
 }
 

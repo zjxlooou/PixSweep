@@ -118,7 +118,6 @@ export interface McpStatus {
 export interface SystemInfo {
   gpu_available: boolean;
   gpu_name: string | null;
-  clip_model_available: boolean;
   /** 主技术质量模型（TOPIQ-NR）是否可用 */
   technical_model_available: boolean;
   data_dir: string;

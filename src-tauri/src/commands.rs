@@ -37,21 +37,14 @@ pub fn get_system_info(state: State<'_, AppState>) -> SystemInfo {
     let info = SystemInfo {
         gpu_available,
         gpu_name,
-        clip_model_available: models.join("clip-vit-b32-visual.onnx").exists(),
         technical_model_available: models.join(crate::ai::engine::TOPIQ_NR_MODEL).exists(),
         data_dir: crate::app_data_dir().to_string_lossy().to_string(),
     };
     log::info!(
-        "[系统信息] GPU 可用: {}, GPU 名称: {:?}, CLIP 模型: {}, TOPIQ-NR 模型: {}",
+        "[系统信息] GPU 可用: {}, GPU 名称: {:?}, TOPIQ-NR 模型: {}",
         info.gpu_available,
         info.gpu_name,
-        info.clip_model_available,
         info.technical_model_available
-    );
-    log::info!(
-        "[系统信息] 后备模型 —— CLIP-IQA: {}, NIMA: {}",
-        models.join(crate::ai::engine::CLIP_IQA_MODEL).exists(),
-        models.join(crate::ai::engine::NIMA_TECH_MODEL).exists(),
     );
     info
 }

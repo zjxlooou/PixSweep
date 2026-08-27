@@ -104,7 +104,7 @@ cd PixSweep && bash scripts/test_e2e.sh # 8 阶段全 PASS
 
 完整测试指南见 [`docs/TESTING.md`](./TESTING.md)。
 
-压缩说明：优先使用项目自带 7-Zip（`.tools/7zip/7za.exe`）`-tzip -mx=9` 最大压缩；仅打包代码引用的模型（共 8 个文件：`clip-vit-b32-visual.onnx`（去重核心）/ `topiq_nr.onnx` + `topiq_nr.onnx.data`（技术主评分，配对文件）/ `topiq_iaa_res50.onnx`（美学主评分）/ `clipiqa_model.onnx` + `clipiqa_model.onnx.data`（CLIP-IQA+ 后备，配对文件）/ `nima-technical.onnx`（二级后备）/ `aesthetic_linear.bin`（美学后备）），未引用的模型自动跳过。
+压缩说明：优先使用项目自带 7-Zip（`.tools/7zip/7za.exe`）`-tzip -mx=9` 最大压缩；仅打包代码引用的模型（FP16 精度，共 5 个通用评分文件：`topiq_nr.onnx`（技术主评分）/ `topiq_iaa_res50.onnx`（美学主评分）/ `nima-technical.onnx`（二级后备）/ `topiq_nr_face.onnx` + `topiq_nr_face.onnx.data`（人脸专评，配对文件），另有 `scene/`、`eye/`、`insightface/` 子目录模型），未引用的模型自动跳过。
 
 ---
 
@@ -135,12 +135,12 @@ PixSweep/
 │   │   ├── scanner/         # 文件遍历（walker.rs）
 │   │   ├── hashing/         # dhash + ahash（phash.rs）
 │   │   ├── cluster/         # 相似度聚类（UnionFind）
-│   │   ├── ai/              # ONNX 推理（CLIP + TOPIQ + NIMA + 美学头）
+│   │   ├── ai/              # ONNX 推理（TOPIQ + NIMA + InsightFace + 场景/闭眼/脸网格）
 │   │   ├── quality/         # 质量推荐（recommender.rs）
 │   │   ├── db/              # JSON 缓存（store.rs）
 │   │   ├── fileops/         # 临时回收站（trash.rs）
 │   │   └── cache/           # 缩略图缓存
-│   ├── models/              # AI 模型（gitignore；clip/topiq/nima/aesthetic）
+│   ├── models/              # AI 模型（gitignore；topiq/nima/insightface/scene/eye）
 │   ├── Cargo.toml
 │   ├── tauri.conf.json
 │   └── capabilities/        # Tauri 2 ACL 权限
@@ -273,7 +273,8 @@ MIT License
 
 - [Tauri](https://tauri.app/) — 桌面应用框架
 - [ONNX Runtime](https://onnxruntime.ai/) — ML 推理引擎
-- [CLIP](https://github.com/openai/CLIP) — OpenAI 视觉模型
+- [InsightFace](https://github.com/deepinsight/insightface) — 人脸检测
+- [MediaPipe Face Landmarker](https://developers.google.com/mediapipe) — 人脸网格（闭眼检测）
 - [TOPIQ](https://arxiv.org/abs/2308.03060) — 技术 + 美学质量评估（主评分模型）
 - [NIMA](https://github.com/idealo/image-quality-assessment) — 质量评估（后备）
 - [image](https://github.com/image-rs/image) — Rust 图像库

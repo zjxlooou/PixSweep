@@ -31,7 +31,7 @@ fn main() {
 
     let model_dir = {
         let manifest = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("models");
-        if manifest.join("clip-vit-b32-visual.onnx").exists() { manifest } else { models_dir() }
+        if manifest.join("topiq_nr.onnx").exists() { manifest } else { models_dir() }
     };
     let engine = AiEngine::new(&model_dir).expect("引擎初始化失败");
     println!(

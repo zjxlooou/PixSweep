@@ -371,7 +371,6 @@ fn execute_tool(name: &str, args: &Value, app: &AppHandle) -> (String, bool) {
             let info = SystemInfo {
                 gpu_available: crate::commands::gpu_available(),
                 gpu_name: crate::commands::gpu_name(),
-                clip_model_available: crate::models_dir().join("clip-vit-b32-visual.onnx").exists(),
                 #[cfg(feature = "ai")]
                 technical_model_available: crate::models_dir()
                     .join(crate::ai::engine::TOPIQ_NR_MODEL)

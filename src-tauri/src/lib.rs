@@ -3,7 +3,7 @@
 //! 本 crate 是 PixSweep 的 Rust 后端核心（`lib` 目标，被 `main.rs` 调用 `run()` 启动）。
 //! 主要职责：
 //!
-//! - **图片扫描与去重**：递归扫描目录 → 感知哈希（pHash/dHash）初筛 → CLIP embedding
+//! - **图片扫描与去重**：递归扫描目录 → 感知哈希（pHash/dHash）初筛
 //!   语义聚类 → Union-Find 分组，找出内容重复/高度相似的图片组。
 //! - **双维度 AI 评分**（`ai` feature）：对组内图片做技术质量（TOPIQ-NR）+ 美学
 //!   （TOPIQ-IAA）评分，综合分最高者标记为"推荐保留"。
@@ -11,7 +11,7 @@
 //! - **MCP server**：HTTP JSON-RPC 接口（127.0.0.1:18765），供外部 Agent 调用。
 //!
 //! ## 模块结构
-//! - [`ai`]：AI 推理引擎（CLIP / TOPIQ / NIMA / 美学头），ONNX Runtime + DirectML。
+//! - [`ai`]：AI 推理引擎（TOPIQ / NIMA），ONNX Runtime + DirectML。
 //! - [`scanner`]：目录遍历 + 图片过滤。
 //! - [`hashing`]：感知哈希（pHash）。
 //! - [`cluster`]：相似度计算 + Union-Find 聚类。
@@ -71,7 +71,7 @@ pub fn models_dir() -> PathBuf {
         .and_then(|p| p.parent().map(|d| d.to_path_buf()))
         .unwrap_or_default();
     let bundled = exe_dir.join("models");
-    if bundled.join("clip-vit-b32-visual.onnx").exists() {
+    if bundled.join("topiq_nr.onnx").exists() {
         return bundled;
     }
     let data = app_data_dir().join("models");
