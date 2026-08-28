@@ -99,6 +99,13 @@ cargo run --example verify_scene -- <目录>                   # 场景分类
 - 模型**缺失不报错**，仅 `log::warn` 并跳过对应能力（真机测要核对日志）。
 - CLIP/LAION 美学后备已移除（2026-08-27）：技术后备链 = TOPIQ-NR → NIMA；美学无后备。
 
+### RAW 相机格式（0.8.1）
+
+- **解码**：rawler 0.7（纯 Rust，dnglab 核心，LGPL-2.1 依赖）。唯一入口在 `image_io::load_image_oriented` 的 RAW 分支——优先机内嵌预览（`full_image` > `preview_image` > `thumbnail_image`，毫秒级，相机端已去马赛克/白平衡），全无嵌入预览才回退全显影（demosaic，实测 RW2 0.4s）。两条路径手动应用 EXIF orientation（官方 `Orientation::from_exif`）。
+- **扩展名清单**：`image_io::RAW_EXTENSIONS` 与 `scanner/walker.rs::SUPPORTED_RAW_EXTENSIONS` 两处保持一致（新增格式要同步改）。23 种：RW2/NEF/NRW/ARW/SRW/CR2/CR3/CRW/RAF/ORF/PEF/PTX/DNG/RAW/RWL/X3F/3FR/ERF/MRW/IIQ/GPR/KDC/DCR。
+- **全链自动生效**：缩略图/AI 评分/代理/哈希/对焦都走 `load_image_oriented`，RAW 无需各自适配。
+- 已实测解码：Panasonic RW2（嵌入预览 1920×1440 + 全显影 0.4s）。探针工具：`examples/probe_raw_decode.rs`。
+
 ### 易变签名
 
 `composite_scores`（engine.rs）与 `build_groups`（quality/recommender.rs）签名改动频繁（前者已从纯 slice 演化为 Option 混合）。改前先查定义与全部调用点（`commands.rs`、`examples/verify_*.rs`、测试），改后逐一同步。

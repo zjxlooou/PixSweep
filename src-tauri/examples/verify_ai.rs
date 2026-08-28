@@ -58,31 +58,29 @@ fn main() {
     if let Ok(entries) = std::fs::read_dir(&dir) {
         for e in entries.flatten() {
             let p = e.path();
-            if let Some(ext) = p.extension().and_then(|s| s.to_str()) {
-                let ext = ext.to_lowercase();
-                if !matches!(ext.as_str(), "jpg" | "jpeg" | "png" | "bmp" | "webp") {
-                    continue;
+            // 与生产扫描器同一判定（含相机 RAW）
+            if !pixsweep_lib::scanner::walker::is_supported_image(&p) {
+                continue;
+            }
+            let path = p.to_string_lossy().to_string();
+            match image_io::load_image_oriented(&path) {
+                Ok(img) => {
+                    let (w, h) = img.dimensions();
+                    let size = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
+                    let name = Path::new(&path)
+                        .file_name()
+                        .map(|s| s.to_string_lossy().to_string())
+                        .unwrap_or_default();
+                    println!("[verify]   {}  {}x{}  (EXIF 方向解码 OK)", name, w, h);
+                    imgs.push(Img {
+                        path,
+                        name,
+                        width: w,
+                        height: h,
+                        size,
+                    });
                 }
-                let path = p.to_string_lossy().to_string();
-                match image_io::load_image_oriented(&path) {
-                    Ok(img) => {
-                        let (w, h) = img.dimensions();
-                        let size = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
-                        let name = Path::new(&path)
-                            .file_name()
-                            .map(|s| s.to_string_lossy().to_string())
-                            .unwrap_or_default();
-                        println!("[verify]   {}  {}x{}  (EXIF 方向解码 OK)", name, w, h);
-                        imgs.push(Img {
-                            path,
-                            name,
-                            width: w,
-                            height: h,
-                            size,
-                        });
-                    }
-                    Err(err) => println!("[verify]   （解码失败）{}: {}", p.display(), err),
-                }
+                Err(err) => println!("[verify]   （解码失败）{}: {}", p.display(), err),
             }
             if imgs.len() >= limit {
                 break;

@@ -20,7 +20,7 @@
 
 | 功能 | 说明 |
 |------|------|
-| 多格式扫描 | jpg / png / webp / bmp / gif / tiff / heic |
+| 多格式扫描 | jpg / png / webp / bmp / gif / tiff / heic + 相机 RAW 23 种（RW2 / NEF / ARW / CR2 / CR3 / RAF / ORF / DNG 等，rawler 解码） |
 | 双哈希聚类 | dhash + ahash，过滤渐变图误判 |
 | 人像优先评分 | 人脸专评 / 闭眼（垂目+眨眼双信号）/ 眼部对焦 / 场景分级（TOPIQ + InsightFace + MediaPipe 脸网格 + OCEC，本地推理） |
 | 对焦检测 | 拉普拉斯方差清晰度指标，标出失焦照片 |

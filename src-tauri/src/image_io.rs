@@ -21,12 +21,48 @@ use std::path::Path;
 
 use image::{DynamicImage, ImageDecoder, ImageReader};
 
+/// 支持的相机 RAW 扩展名（小写）。覆盖主流品牌原生态格式 + DNG 通用容器。
+pub const RAW_EXTENSIONS: &[&str] = &[
+    "rw2",             // Panasonic
+    "nef", "nrw",      // Nikon
+    "arw", "srw",      // Sony
+    "cr2", "cr3", "crw", // Canon
+    "raf",             // Fujifilm
+    "orf",             // Olympus
+    "pef", "ptx",      // Pentax
+    "dng",             // Adobe/DNG 通用容器（Leica/大疆等）
+    "raw", "rwl",      // Leica / Panasonic 旧款
+    "x3f",             // Sigma Foveon
+    "3fr",             // Hasselblad
+    "erf",             // Epson
+    "mrw",             // Minolta
+    "iiq",             // Phase One
+    "gpr", "kdc", "dcr", // GoPro / Kodak
+];
+
+/// 判断路径是否为相机 RAW 文件（按扩展名）。
+pub fn is_raw_image<P: AsRef<Path>>(path: P) -> bool {
+    path.as_ref()
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(|e| RAW_EXTENSIONS.contains(&e.to_ascii_lowercase().as_str()))
+        .unwrap_or(false)
+}
+
 /// 读取图片并自动应用 EXIF Orientation，返回按用户预期方向显示的 DynamicImage。
 ///
 /// 流程：识别格式 → into_decoder() 取 orientation → decode → apply。
 /// 任何格式转换错误都向上传播。
+///
+/// **RAW 分支**（2026-08-27，rawler 0.7）：扩展名命中 [`is_raw_image`] 时改走
+/// rawler 解码——优先取机内嵌预览（`full_image` > `preview_image` > `thumbnail_image`，
+/// 相机端已完成去马赛克/白平衡/降噪，毫秒级），全无嵌入预览时回退全显影
+/// （demosaic → sRGB，秒级）。两种路径都按 RAW 内 EXIF orientation 旋转。
 pub fn load_image_oriented<P: AsRef<Path>>(path: P) -> anyhow::Result<DynamicImage> {
     let path_ref = path.as_ref();
+    if is_raw_image(path_ref) {
+        return load_raw_oriented(path_ref);
+    }
 
     let reader = ImageReader::open(path_ref)
         .map_err(|e| anyhow::anyhow!("打开图片失败 {}: {}", path_ref.display(), e))?
@@ -64,3 +100,58 @@ pub fn exif_orientation<P: AsRef<Path>>(path: P) -> anyhow::Result<image::metada
         .orientation()
         .unwrap_or(image::metadata::Orientation::NoTransforms))
 }
+/// RAW 解码：机内嵌预览优先（毫秒级），全无嵌入预览时回退全显影（秒级）。
+///
+/// 两条路径都不自带旋转，统一按 RAW 内 EXIF orientation 手动应用
+/// （预览走 `raw_metadata.exif.orientation`，显影走 `raw.orientation`）。
+fn load_raw_oriented(path: &Path) -> anyhow::Result<DynamicImage> {
+    use rawler::decoders::RawDecodeParams;
+    use rawler::imgop::develop::RawDevelop;
+    use rawler::rawsource::RawSource;
+    use rawler::get_decoder;
+
+    let rawfile = RawSource::new(path)
+        .map_err(|e| anyhow::anyhow!("RAW 打开失败 {}: {e}", path.display()))?;
+    let decoder = get_decoder(&rawfile)
+        .map_err(|e| anyhow::anyhow!("RAW 无可用解码器 {}: {e}", path.display()))?;
+    let params = RawDecodeParams::default();
+
+    // EXIF 方向（元数据提取失败按无旋转处理）
+    let exif_u16 = decoder
+        .raw_metadata(&rawfile, &params)
+        .ok()
+        .and_then(|md| md.exif.orientation);
+    let apply = |img: DynamicImage| -> DynamicImage {
+        let mut img = img;
+        if let Some(o) = exif_u16.and_then(|v| u8::try_from(v).ok()).and_then(image::metadata::Orientation::from_exif) {
+            img.apply_orientation(o);
+        }
+        img
+    };
+
+    // 快路径：机内嵌预览（full > preview > thumbnail，取到即用）
+    for attempt in [
+        decoder.full_image(&rawfile, &params),
+        decoder.preview_image(&rawfile, &params),
+        decoder.thumbnail_image(&rawfile, &params),
+    ] {
+        if let Ok(Some(img)) = attempt {
+            return Ok(apply(img));
+        }
+    }
+
+    // 慢路径：全显影（demosaic → 白平衡 → 色彩转换 → sRGB）
+    log::info!("[RAW] 无机内嵌预览，走全显影: {}", path.display());
+    let raw = decoder.raw_image(&rawfile, &params, false)?;
+    let orientation = exif_u16.or_else(|| Some(raw.orientation.to_u16()));
+    let img = RawDevelop::default()
+        .develop_intermediate(&raw)?
+        .to_dynamic_image()
+        .ok_or_else(|| anyhow::anyhow!("RAW 显影输出为空: {}", path.display()))?;
+    let mut img = img;
+    if let Some(o) = orientation.and_then(|v| u8::try_from(v).ok()).and_then(image::metadata::Orientation::from_exif) {
+        img.apply_orientation(o);
+    }
+    Ok(img)
+}
+

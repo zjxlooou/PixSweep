@@ -9,12 +9,21 @@ const SUPPORTED_EXTENSIONS: &[&str] = &[
     "jpg", "jpeg", "png", "webp", "bmp", "tif", "tiff", "gif", "heic", "heif",
 ];
 
+/// 支持的相机 RAW 扩展名（小写），与 [`crate::image_io::RAW_EXTENSIONS`] 保持一致。
+/// RAW 走 rawler 解码（机内嵌预览优先，见 image_io::load_raw_oriented）。
+const SUPPORTED_RAW_EXTENSIONS: &[&str] = &[
+    "rw2", "nef", "nrw", "arw", "srw", "cr2", "cr3", "crw", "raf", "orf", "pef",
+    "ptx", "dng", "raw", "rwl", "x3f", "3fr", "erf", "mrw", "iiq", "gpr", "kdc", "dcr",
+];
+
 /// 判断路径是否为支持的图片文件。
 pub fn is_supported_image(path: &Path) -> bool {
     let Some(ext) = path.extension().and_then(|e| e.to_str()) else {
         return false;
     };
-    SUPPORTED_EXTENSIONS.contains(&ext.to_ascii_lowercase().as_str())
+    let ext = ext.to_ascii_lowercase();
+    SUPPORTED_EXTENSIONS.contains(&ext.as_str())
+        || SUPPORTED_RAW_EXTENSIONS.contains(&ext.as_str())
 }
 
 /// 生成文件指纹：基于路径 + 大小 + 修改时间。用于增量扫描判定文件是否变化。
@@ -87,4 +96,26 @@ pub fn scan_folders(folders: &[PathBuf]) -> Vec<ImageInfo> {
     }
 
     result
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn supported_extensions_cover_common_and_raw() {
+        for p in [
+            "a.jpg", "a.jpeg", "a.png", "a.webp", "a.heic",
+            // 主流品牌 RAW
+            "a.rw2", "a.nef", "a.arw", "a.cr2", "a.cr3", "a.raf", "a.orf",
+            "a.dng", "a.raw", "a.iiq",
+            // 大小写不敏感
+            "a.NEF", "a.Rw2",
+        ] {
+            assert!(is_supported_image(Path::new(p)), "应支持: {p}");
+        }
+        for p in ["a.txt", "a.mp4", "a.exe", "a.tifff", "a"] {
+            assert!(!is_supported_image(Path::new(p)), "不应支持: {p}");
+        }
+    }
 }
