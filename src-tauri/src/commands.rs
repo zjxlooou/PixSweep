@@ -454,10 +454,11 @@ pub fn run_scan(
     };
 
     let emit = |phase: ScanPhase, current: usize, total: usize, current_file: Option<String>, detail: &str| {
-        // 按阶段/子阶段展示实际硬件：扫描/哈希/聚类是纯 CPU；
-        // AI 评分展示推理后端（"对焦判断"子阶段是纯 CPU 拉普拉斯方差，不跑模型）
+        // 按阶段/子阶段展示主要硬件：扫描/哈希/聚类是纯 CPU；AI 评分展示推理后端。
+        // "对焦判断"主计算是 CPU（解码 + 拉普拉斯方差），但人像路径含 GPU 人脸检测
+        // （InsightFace det_10g 定位眼 ROI），故标注 CPU+GPU。
         let backend = match phase {
-            ScanPhase::Quality if detail == "对焦判断" => "CPU".to_string(),
+            ScanPhase::Quality if detail == "对焦判断" => "CPU+GPU".to_string(),
             ScanPhase::Quality => backend_label.clone(),
             _ => "CPU".to_string(),
         };
