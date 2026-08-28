@@ -237,6 +237,29 @@ Wikimedia Commons 4 类（人像/狗/风景/食物）× 合成降级（blur/jpeg
 
 ---
 
+### 2026-08-28 — 0.8.1：相机 RAW 多格式兼容（23 种）
+
+**需求**：支持主流相机品牌原图格式（RW2/NEF/ARW/CR3/RAF/ORF/DNG 等）进入扫描→去重→评分→显示全链。
+
+**选型**：rawler 0.7.2（纯 Rust，dnglab 的解码核心，LGPL-2.1 依赖）——零 C 编译依赖，契合无 MSVC 工具链；LibRaw 绑定因需编 C++ 被排除。
+
+**实现**（唯一解码漏斗接入，全链自动生效）：
+- `image_io::load_image_oriented` 增 RAW 分支：机内嵌预览优先（`full_image` > `preview_image` > `thumbnail_image`，相机端已完成去马赛克/白平衡/降噪，毫秒级），全无嵌入预览才回退全显影（demosaic→sRGB，RW2 实测 0.4s）；两条路径手动应用 EXIF orientation（官方 `Orientation::from_exif`）。
+- `scanner/walker` 增 23 种扩展名 + 单测；`RAW_EXTENSIONS` 与 walker 清单两处需同步维护（已注明）。
+- 缩略图（dataUrl 由后端生成）、AI 评分、代理、哈希、对焦全部走 `load_image_oriented`——RAW 无需任何单独适配。扫描阶段宽高 0×0 属瞬态，哈希阶段真解码后回填。
+
+**验证**（样张来自 raw.pixls.us，代理下载；部分 LFS 慢件用 HEAD 限 45MB + 短超时规避卡死）：
+- **RW2/NEF/ARW/CR3 四品牌 100% 通过**：四家均含机内嵌全尺寸预览（1920×1440~5088×3392），
+  全显影回退 0.4~1.6s；四品牌全过生产漏斗 + verify_ai 完整评分链 + 确定性双跑逐位一致；
+  Sony ARW 实测竖图方向旋转正确（预览 1920×1080 横 → 漏斗输出 1080×1920 竖）；
+  Canon CR3 为 EOS R5 的 CRAW 压缩变体（ISO-BMFF 容器）也通过；scan_folder 正确收录；walker 扩展名单测过。
+- RAF/ORF/DNG 等样张因 pixls LFS 慢件下载受限未逐一实测——覆盖率由 rawler（dnglab 同引擎）背书；
+  个别变体解码失败时该文件被优雅跳过（hash=None，不参与分组评分，不崩溃）。
+
+**版本**：0.8.1；发布包 429MB（较 0.7.3 的 999MB -57%）。
+
+---
+
 ## 评分模型演进（重要）
 
 | 阶段 | 技术评分 | 美学评分 | 时间 |
