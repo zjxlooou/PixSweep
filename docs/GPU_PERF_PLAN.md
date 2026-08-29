@@ -1,0 +1,87 @@
+# GPU 利用率优化计划（2026-08-29）
+
+> 背景：用户反馈扫描期间 GPU 利用率低（<5%）。经实测拆解，AI 评分链（350 张，
+> 62s）中**人脸检测阶段占 27s（43%）**——SCRFD 640×640 逐张串行推理，且
+> det_10g 官方 ONNX **batch=1 硬编码**（insightface 发布版未用 PR #1781 的
+> dynamic-axes 修复重导出）。GPU 利用率低不是 GPU 不够快，而是小模型单张
+> 推理时 kernel launch / 拷贝开销占比过高、且阶段间存在 GPU 空窗。
+>
+> 原则：**利用率是手段，墙钟时间是目标**。每步都跑基准回归（闭眼标注集
+> 7/7、RAW+JPG 成对一致性、确定性双跑）后才允许合入。
+
+## 实测瓶颈画像（350 张，RTX 5070，0.8.3）
+
+| 阶段 | 耗时 | 占比 | GPU 形态 |
+|---|---|---|---|
+| 人脸专评（SCRFD+align+nr_face） | 26.9s | 43% | 640×640 单张串行，batch=1 |
+| 场景分类（MobileNet 224） | 12.7s | 20% | 批 64 预处理并行、推理串行 |
+| TOPIQ nr/iaa（动态 batch 16） | 7.4s | 12% | 已批量化，形态最好 |
+| 闭眼（网格+OCEC，复用检测） | 4.2s | 7% | 逐张串行 |
+| HyperIQA（512 逐张） | 2.1s | 3% | fix batch=1 |
+| 对焦 | ~2s | 3% | 无模型（CPU） |
+
+## 优化项（按 ROI 排序）
+
+### M1 — SCRFD 动态 batch 重导出（预计 AI 链 62s → ~45s）
+
+- 现状：insightface PR #1781 已修复 SCRFD 导出脚本的 dynamic_axes，但
+  buffalo 包的 det_10g.onnx 从未用修复版重导出；HuggingFace 有现成重导出
+  （`ceyxprime/scrfd_640_batched` 等）可先验证。
+- 做法：获得/重导出 dynamic-batch det_10g → 每批 letterbox 后 8~16 张
+  一次推理 → 现有 Rust NMS 逐图解码输出（输出 shape 多一个 batch 维）。
+- 验收：bbox/keypoint 与单张版逐位一致（小数值容差内）；人脸专评 ≤12s。
+- 风险：重导出模型的输出布局/关键点顺序与 det_10g 有差异——用基准图
+  矩阵比对；不匹配就自己走 PR #1781 脚本重导出。
+
+### M2 — IO Binding + 固定形状输入（预计再 -10~15%）
+
+- ort 2.0.0-rc.13 已支持 `session.create_binding()`（IoBinding）与
+  `ep::CUDA::with_cuda_graph(true)`。
+- IO Binding：为固定形状输入（TOPIQ 16×3×384×384、scene 64×224、
+  SCRFD 16×640×640）预分配 GPU 输入/输出缓冲 + pinned host staging，
+  消除每批的 H2D/D2H 往返。小模型拷贝开销占比高，收益明显。
+- 风险：绑定错设备反而变慢（GitHub #10000 的教训）——每模型单独基准。
+
+### M3 — CUDA Graphs（固定形状场景消除 launch overhead，预计再 -10~20%）
+
+- 适用：形状完全固定的推理（SCRFD 批 16、scene 批 64、hyperiqa 单张）。
+  TOPIQ 动态 batch 最后一块需 pad 到 16。
+- 限制：启用 CUDA Graphs 后该 session **不可多线程并发 Run**；形状一变
+  要重新捕获。逐 session 评估，只给收益明确的模型开。
+- 与 M1/M2 叠加。
+
+### M4 — 阶段流水线化（消灭阶段间 GPU 空窗，预计再 -15~25%）
+
+- 现状：整库跑完一个阶段才进下一个（topiq → scene → face → eye → ...），
+  阶段边界 GPU 空闲。
+- 做法：不同 session 允许并发 Run——把 scene（MobileNet）与 face（SCRFD）
+  重叠；或按 chunk 组织"一张图的全部模型工作"，GPU 永远有活干。
+- 依赖 M1（face 批量化）先落地，否则流水线救不了串行 SCRFD。
+
+### M5 — TensorRT EP（可选大杀器，最后评估）
+
+- 社区报告 ~2× 收益（TRT 全图融合 + fp16 kernel），代价：包体 +~100MB
+  TRT DLL、每 GPU 首次构建引擎分钟级（`trt_engine_cache_enable` 可缓存）、
+  精度可能有差异（YOLOv8 有先例）。
+- 注意：小模型 + 动态形状场景 CUDA EP 有追平 TRT 的先例（NVIDIA 论坛）。
+  **决策点：M1~M4 做完后基准仍不达标，才做 1 天 spike 实测定去留。**
+
+## 不做的事
+
+- 不盲换更小的检测模型（det_500m 等）：人脸关键点精度是闭眼/眼对焦的地基，
+  精度回归风险大于性能收益。先榨现有模型的工程空间。
+- 不上多进程/多 GPU：单 GPU 单进程内并发（多 session 多流）已够。
+
+## 验收基线（每里程碑必须全绿）
+
+1. 闭眼标注集 7/7；
+2. RAW+JPG 成对技术分差 ≤0.08 / 美学 ≤0.02；
+3. 确定性双跑逐位一致；
+4. AI 评分链墙钟时间（350 张）。
+
+## 参考来源
+
+- ORT CUDA EP 并发/流：https://onnxruntime.ai/docs/execution-providers/CUDA-ExecutionProvider.html 、https://github.com/microsoft/onnxruntime/issues/23319
+- IO Binding：https://onnxruntime.ai/docs/performance/tune-performance/iobinding.html 、https://onnxruntime.ai/docs/performance/device-tensor.html
+- TensorRT EP：https://onnxruntime.ai/docs/execution-providers/TensorRT-ExecutionProvider.html 、https://developer.nvidia.com/blog/end-to-end-ai-for-nvidia-based-pcs-cuda-and-tensorrt-execution-providers-in-onnx-runtime/
+- SCRFD batch=1 硬编码与重导出：https://github.com/deepinsight/insightface/issues/2643 、https://github.com/deepinsight/insightface/issues/2879 、https://huggingface.co/ceyxprime/scrfd_640_batched
