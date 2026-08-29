@@ -8,7 +8,7 @@
  *  - ←/→：切换组内上一张 / 下一张照片
  *  - Enter：删除组内除推荐外的所有照片（保留推荐）
  *  - Esc：退出预览
- *  - Ctrl + 滚轮：缩放
+ *  - 滚轮：缩放（以鼠标位置为中心）
  *  - 左键拖动图片：平移（仅缩放后有效）
  *  - 右键图片 / 缩略图：弹出菜单（删除当前 / 删除其他）
  */
@@ -78,6 +78,10 @@ export function PreviewModal({
   const [pan, setPan] = useState({ x: 0, y: 0 });
   const [isDragging, setIsDragging] = useState(false);
   const dragStart = useRef<{ x: number; y: number; panX: number; panY: number } | null>(null);
+  // 缩放/平移的 ref 镜像（滚轮以鼠标为锚点计算需要当前值，避免 setState 闭包陈旧）
+  const scaleRef = useRef(1);
+  const panRef = useRef({ x: 0, y: 0 });
+  const stageRef = useRef<HTMLDivElement | null>(null);
 
   const groups = useMemo(() => result.groups, [result]);
   const group = useMemo(
@@ -182,6 +186,8 @@ export function PreviewModal({
 
   // 重置缩放/位移
   const resetView = useCallback(() => {
+    scaleRef.current = 1;
+    panRef.current = { x: 0, y: 0 };
     setScale(1);
     setPan({ x: 0, y: 0 });
   }, []);
@@ -191,13 +197,33 @@ export function PreviewModal({
     resetView();
   }, [currentImage, resetView]);
 
-  // Ctrl+滚轮缩放
-  const handleWheel = useCallback((e: React.WheelEvent) => {
-    if (!e.ctrlKey) return;
-    e.preventDefault();
-    e.stopPropagation();
-    const delta = e.deltaY > 0 ? -0.1 : 0.1;
-    setScale((s) => Math.max(0.1, Math.min(10, s + delta)));
+  // 滚轮缩放（以鼠标位置为中心）。
+  // React 的 onWheel 是 passive 监听，preventDefault 无效——用原生非 passive 监听。
+  useEffect(() => {
+    const el = stageRef.current;
+    if (!el) return;
+    const onWheel = (e: WheelEvent) => {
+      e.preventDefault();
+      e.stopPropagation();
+      const rect = el.getBoundingClientRect();
+      // 鼠标相对图片元素中心（transform 原点）的坐标
+      const px = e.clientX - (rect.left + rect.width / 2);
+      const py = e.clientY - (rect.top + rect.height / 2);
+      const prev = scaleRef.current;
+      const next = Math.max(1, Math.min(10, prev + (e.deltaY > 0 ? -0.15 : 0.15)));
+      if (next === prev) return;
+      // 锚点不动：pan' + s'*p = pan + s*p  =>  pan' = pan + (s - s')*p
+      const nextPan = {
+        x: panRef.current.x + (prev - next) * px,
+        y: panRef.current.y + (prev - next) * py,
+      };
+      scaleRef.current = next;
+      panRef.current = next <= 1 ? { x: 0, y: 0 } : nextPan;
+      setScale(next);
+      setPan(panRef.current);
+    };
+    el.addEventListener("wheel", onWheel, { passive: false });
+    return () => el.removeEventListener("wheel", onWheel);
   }, []);
 
   // 左键拖动图片
@@ -325,8 +351,8 @@ export function PreviewModal({
       <div className="preview-shell" onClick={(e) => e.stopPropagation()}>
         {/* ===== 左侧：大图主区 ===== */}
         <div
+          ref={stageRef}
           className={`preview-main ${isDragging ? "dragging" : ""}`}
-          onWheel={handleWheel}
           onMouseDown={handleMouseDown}
         >
           {/* 顶栏：组号 + 计数 + 缩放/重置 */}
@@ -349,7 +375,7 @@ export function PreviewModal({
                     onClick={(e) => { e.stopPropagation(); setScale((s) => Math.max(0.1, s - 0.2)); }}
                     title="缩小"
                   >−</button>
-                  <span className="preview-zoom-val" title="100% = 图片填满容器，Ctrl+滚轮可缩放">
+                  <span className="preview-zoom-val" title="100% = 图片填满容器，滚轮缩放（以鼠标为中心）">
                     {Math.round(scale * 100)}%
                   </span>
                   <button
@@ -582,7 +608,7 @@ export function PreviewModal({
               删除其他 {deleteCount} 张（保留推荐）
             </button>
             <div className="preview-sidebar-hint">
-              ←/→ 切换照片 · Ctrl+滚轮缩放 · 右键图片呼出菜单
+              ←/→ 切换照片 · 滚轮缩放 · 右键图片呼出菜单
             </div>
           </div>
         </aside>

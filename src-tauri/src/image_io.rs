@@ -236,6 +236,40 @@ pub fn header_dimensions<P: AsRef<Path>>(path: P) -> Option<(u32, u32)> {
     }
 }
 
+/// RAW 全显影：demosaic → 白平衡 → 色彩转换 → sRGB（传感器原生分辨率，EXIF 转正）。
+///
+/// 仅用于**预览查看**：机内嵌预览常常只有 1~2MP，放大后远不如同画面 JPG 清晰；
+/// 全显影给出传感器原生分辨率（0.4~1.6s，调用方负责磁盘缓存）。AI 分析仍走
+/// 机内嵌预览（统一前置代理），两侧口径互不影响。
+pub fn load_raw_developed(path: &Path) -> anyhow::Result<DynamicImage> {
+    use rawler::decoders::RawDecodeParams;
+    use rawler::get_decoder;
+    use rawler::imgop::develop::RawDevelop;
+    use rawler::rawsource::RawSource;
+
+    let _guard = DecodeGuard::acquire();
+    let rawfile = RawSource::new(path)
+        .map_err(|e| anyhow::anyhow!("RAW 打开失败 {}: {e}", path.display()))?;
+    let decoder = get_decoder(&rawfile)
+        .map_err(|e| anyhow::anyhow!("RAW 无可用解码器 {}: {e}", path.display()))?;
+    let params = RawDecodeParams::default();
+    let exif_u16 = decoder
+        .raw_metadata(&rawfile, &params)
+        .ok()
+        .and_then(|md| md.exif.orientation);
+    let raw = decoder.raw_image(&rawfile, &params, false)?;
+    let orientation = exif_u16.or_else(|| Some(raw.orientation.to_u16()));
+    let img = RawDevelop::default()
+        .develop_intermediate(&raw)?
+        .to_dynamic_image()
+        .ok_or_else(|| anyhow::anyhow!("RAW 显影输出为空: {}", path.display()))?;
+    let mut img = img;
+    if let Some(o) = orientation.and_then(|v| u8::try_from(v).ok()).and_then(image::metadata::Orientation::from_exif) {
+        img.apply_orientation(o);
+    }
+    Ok(img)
+}
+
 /// RAW 解码：机内嵌预览优先（毫秒级），全无嵌入预览时回退全显影（秒级）。
 ///
 /// 两条路径都不自带旋转，统一按 RAW 内 EXIF orientation 手动应用

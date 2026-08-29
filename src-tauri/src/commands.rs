@@ -129,10 +129,33 @@ pub fn get_full_image(path: String) -> Result<String, String> {
     const MAX_SIDE: u32 = 3072;
     const JPEG_QUALITY: u8 = 92;
 
-    let img = crate::image_io::load_image_oriented(&path).map_err(|e| {
-        log::warn!("[预览] 打开图片失败 {}: {}", path, e);
-        format!("无法打开图片: {}", e)
-    })?;
+    // RAW 预览缓存命中：全显影结果已落盘，直接回（0.4~1.6s 显影只做一次）
+    let is_raw = crate::image_io::is_raw_image(&path);
+    if is_raw {
+        if let Ok(bytes) = std::fs::read(raw_preview_cache_path(&path)) {
+            return Ok(crate::cache::thumbnail::to_data_url(&bytes));
+        }
+    }
+
+    // RAW 用全显影（传感器原生分辨率）：机内嵌预览往往只有 1~2MP，放大后
+    // 远不如同画面 JPG 清晰（2026-08-29 用户反馈）；显影失败回退嵌入预览。
+    let img = if is_raw {
+        match crate::image_io::load_raw_developed(std::path::Path::new(&path)) {
+            Ok(img) => img,
+            Err(e) => {
+                log::warn!("[预览] RAW 全显影失败，回退机内嵌预览 {}: {}", path, e);
+                crate::image_io::load_image_oriented(&path).map_err(|e| {
+                    log::warn!("[预览] 打开图片失败 {}: {}", path, e);
+                    format!("无法打开图片: {}", e)
+                })?
+            }
+        }
+    } else {
+        crate::image_io::load_image_oriented(&path).map_err(|e| {
+            log::warn!("[预览] 打开图片失败 {}: {}", path, e);
+            format!("无法打开图片: {}", e)
+        })?
+    };
 
     // 若超过最大边则等比缩放（保留原图质量，仅降采样）。
     // 统一转 RGB8：JPEG 编码器不支持 alpha 通道（PNG/WebP 等格式可能有 alpha），
@@ -173,7 +196,25 @@ pub fn get_full_image(path: String) -> Result<String, String> {
         scaled.height(),
         buf.len() as f64 / 1024.0
     );
+
+    // RAW：全显影结果落盘缓存（full_preview/），下次预览秒开
+    if is_raw {
+        let cache = raw_preview_cache_path(&path);
+        if let Some(dir) = cache.parent() {
+            let _ = std::fs::create_dir_all(dir);
+        }
+        let _ = std::fs::write(&cache, &buf);
+    }
+
     Ok(crate::cache::thumbnail::to_data_url(&buf))
+}
+
+/// RAW 预览缓存路径（全显影 → 3072 上限 JPEG q92，键为源文件路径）。
+fn raw_preview_cache_path(path: &str) -> PathBuf {
+    let key = blake3::hash(path.as_bytes());
+    crate::app_data_dir()
+        .join("full_preview")
+        .join(format!("v1-{}.jpg", key.to_hex()))
 }
 
 /// 快速统计文件夹内图片总数（只遍历 + 扩展名过滤，不读图、不哈希、不 AI）。
@@ -651,6 +692,14 @@ pub fn run_scan(
             ai_enabled: result.ai_enabled,
         },
     );
+
+    // 扫描收尾：延迟收缩工作集（给前端/MCP 取结果留时间），物理内存占用立即回落。
+    // 代理图/评分缓存仍在磁盘，下次扫描照常增量。
+    std::thread::spawn(|| {
+        std::thread::sleep(std::time::Duration::from_secs(5));
+        trim_working_set();
+        log_process_mem("scan trim working set");
+    });
 }
 
 fn ai_enabled() -> bool {
@@ -801,6 +850,20 @@ fn log_process_mem(tag: &str) {
 fn log_process_mem(tag: &str) {
     let _ = tag;
 }
+
+/// 请求系统收缩进程工作集：把闲置页移出物理内存，任务管理器"内存"列立即回落。
+/// 提交内存（堆记账）不会减少，但物理 RAM 释放。扫描/清理完成后后台调用。
+#[cfg(windows)]
+fn trim_working_set() {
+    use windows_sys::Win32::System::ProcessStatus::EmptyWorkingSet;
+    use windows_sys::Win32::System::Threading::GetCurrentProcess;
+    unsafe {
+        let _ = EmptyWorkingSet(GetCurrentProcess());
+    }
+}
+
+#[cfg(not(windows))]
+fn trim_working_set() {}
 
 fn hash_from_path(path: &str) -> Option<(u64, u64, u32, u32)> {
     // 哈希从统一代理图计算：全库对每张图只做一次全分辨率解码（即生成代理那一次），
@@ -1081,10 +1144,8 @@ fn score_groups_with_ai(
             .filter(|&i| scenes[i] != crate::ai::scene::Scene::Portrait)
             .collect();
         if !targets.is_empty() {
-            const CHUNK: usize = 16;
             let fuse_start = std::time::Instant::now();
             emit(ScanPhase::Quality, 0, targets.len(), None, "美学融合");
-            let mut done = 0usize;
             // **必须逐张推理**：HyperIQA 是 fix batch=1 导出，批量输入会静默产生
             // 错误结果，且其密集层中间张量随 batch 线性膨胀——batch=16 单次 run
             // 实测触碰 3.2GB 主机内存（2026-08-29 内存排查）。
