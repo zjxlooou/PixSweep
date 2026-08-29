@@ -71,11 +71,10 @@ impl Scene {
 // 映射表单独文件 scene_map.rs，避免主文件过长。
 include!("scene_map.rs");
 
-/// 调试辅助：单张图推理并返回 argmax 类索引（供 verify_scene 排查预处理差异）。
-pub fn argmax_of(session: &mut Session, path: &str) -> anyhow::Result<usize> {
-    let img = crate::cache::proxy::ai_proxy(path)?;
+/// 把代理图转成 MobileNetV3 输入张量 [1,3,224,224]，值域 [0,1]（仅 /255，无 ImageNet 归一化）。
+fn scene_input_tensor(img: &image::RgbImage) -> Array4<f32> {
     let resized = image::imageops::resize(
-        &img,
+        img,
         INPUT_SIZE,
         INPUT_SIZE,
         image::imageops::FilterType::Triangle,
@@ -89,37 +88,38 @@ pub fn argmax_of(session: &mut Session, path: &str) -> anyhow::Result<usize> {
             }
         }
     }
-    let tensor = ort::value::Tensor::from_array(batch).context("输入张量失败")?;
+    batch
+}
+
+/// f32 切片的 argmax（并列取首个）。
+fn argmax(values: &[f32]) -> usize {
+    let mut best = 0usize;
+    let mut best_val = f32::NEG_INFINITY;
+    for (i, &v) in values.iter().enumerate() {
+        if v > best_val {
+            best_val = v;
+            best = i;
+        }
+    }
+    best
+}
+
+/// 调试辅助：单张图推理并返回 argmax 类索引（供 verify_scene 排查预处理差异）。
+pub fn argmax_of(session: &mut Session, path: &str) -> anyhow::Result<usize> {
+    let img = crate::cache::proxy::ai_proxy(path)?;
+    let tensor = ort::value::Tensor::from_array(scene_input_tensor(&img)).context("输入张量失败")?;
     let outputs = session
         .run(inputs![INPUT_NAME => tensor])
         .context("推理失败")?;
     let logits = outputs[OUTPUT_NAME]
         .try_extract_array::<f32>()
         .context("输出解析失败")?;
-    let row = logits.slice(ndarray::s![0, ..]);
-    let mut best = 0usize;
-    let mut best_val = f32::NEG_INFINITY;
-    for (i, &v) in row.iter().enumerate() {
-        if v > best_val {
-            best_val = v;
-            best = i;
-        }
-    }
-    Ok(best)
+    Ok(argmax(logits.slice(ndarray::s![0, ..]).as_slice().unwrap_or(&[])))
 }
 
 /// 将 MobileNetV3 输出 logits（[1, 1000]）映射为场景。
 fn logits_to_scene(logits: &[f32]) -> Scene {
-    // 找 argmax 的类索引
-    let mut best = 0usize;
-    let mut best_val = f32::NEG_INFINITY;
-    for (i, &v) in logits.iter().enumerate() {
-        if v > best_val {
-            best_val = v;
-            best = i;
-        }
-    }
-    let code = SCENE_MAP.get(best).copied().unwrap_or(0);
+    let code = SCENE_MAP.get(argmax(logits)).copied().unwrap_or(0);
     match code {
         2 => Scene::Pet,
         3 => Scene::Landscape,
@@ -153,25 +153,9 @@ pub fn classify(session: &mut Session, paths: &[String]) -> anyhow::Result<Vec<S
 
 /// 单张图分类（batch=1）。
 fn classify_one(session: &mut Session, path: &str) -> anyhow::Result<Scene> {
-    // 预处理：[1, 3, 224, 224]，值域 [0,1]（仅 /255，不做 ImageNet 归一化）
     let img = crate::cache::proxy::ai_proxy(path)?;
-    let resized = image::imageops::resize(
-        &img,
-        INPUT_SIZE,
-        INPUT_SIZE,
-        image::imageops::FilterType::Triangle,
-    );
-    let mut batch = Array4::<f32>::zeros((1, 3, INPUT_SIZE as usize, INPUT_SIZE as usize));
-    for y in 0..INPUT_SIZE {
-        for x in 0..INPUT_SIZE {
-            let p = resized.get_pixel(x, y);
-            for c in 0..3 {
-                batch[[0, c, y as usize, x as usize]] = p[c] as f32 / 255.0;
-            }
-        }
-    }
-
-    let tensor = ort::value::Tensor::from_array(batch).context("场景分类输入张量失败")?;
+    let tensor =
+        ort::value::Tensor::from_array(scene_input_tensor(&img)).context("场景分类输入张量失败")?;
     let outputs = session
         .run(inputs![INPUT_NAME => tensor])
         .context("场景分类推理失败")?;

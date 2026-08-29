@@ -167,7 +167,7 @@ if (Test-Path $sevenZip) {
     Compress-Archive -Path "$pkgDir/*" -DestinationPath $zipPath -CompressionLevel Optimal
 }
 
-# 6. 验证
+# 6. 验证 + 清理
 Write-Host ""
 Write-Host "[5/5] 验证打包结果..." -ForegroundColor Yellow
 $zipSize = (Get-Item $zipPath).Length / 1MB
@@ -184,6 +184,12 @@ foreach ($entry in $zip.Entries) {
     Write-Host "    $($entry.FullName)  $origMB MB -> $compMB MB ($ratio)" -ForegroundColor Gray
 }
 $zip.Dispose()
+
+# 清理打包过程用的解包目录（zip 才是发布产物；保留会随版本累积数 GB）
+if (Test-Path $pkgDir) {
+    Remove-Item $pkgDir -Recurse -Force
+    Write-Host "  已清理临时解包目录: $pkgDir" -ForegroundColor Gray
+}
 
 Write-Host ""
 Write-Host "=== 打包完成 ===" -ForegroundColor Cyan

@@ -23,19 +23,10 @@ pub fn topiq_nr_to_score(v: f32) -> f32 {
 
 /// 从 TOPIQ-IAA 的 10-bin softmax 概率分布计算美学评分（1.0~10.0）。
 ///
-/// 与 NIMA 相同：加权平均 Σ(p_i × (i+1))。IAA 输出已是 softmax 概率（和≈1），
-/// 但仍做归一化保护。
+/// 与 NIMA 相同：加权平均 Σ(p_i × (i+1))（[`crate::ai::mos_from_bins`]）。
+/// IAA 输出已是 softmax 概率（和≈1），但仍做归一化保护。
 pub fn topiq_iaa_to_score(dist: &[f32]) -> f32 {
-    let sum: f32 = dist.iter().sum();
-    if sum <= 0.0 {
-        return 5.0;
-    }
-    let weighted: f32 = dist
-        .iter()
-        .enumerate()
-        .map(|(i, &p)| p * (i as f32 + 1.0))
-        .sum();
-    weighted / sum
+    crate::ai::mos_from_bins(dist)
 }
 
 #[cfg(test)]

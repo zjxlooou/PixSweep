@@ -5,7 +5,7 @@
 //! - [`ahash`] 平均哈希
 //!
 //! 感知哈希是轻量级预筛手段，可在不加载 AI 模型的情况下快速识别精确重复；
-//! 语义级相似（构图不同但内容相近）由 AI 的 CLIP embedding 负责。
+//! 双哈希（dhash + ahash）联合校验过滤渐变图误判（见 `cluster::similarity`）。
 
 use image::DynamicImage;
 

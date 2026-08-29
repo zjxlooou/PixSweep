@@ -9,18 +9,10 @@ pub const IS_NHWC: bool = true;
 
 /// 从 NIMA 输出的 10-bin 概率分布计算美学评分（1.0~10.0）。
 ///
-/// 评分 = Σ(bin_i × (i+1)) / Σ(bin_i)，即加权平均的评分等级。
+/// 评分 = Σ(bin_i × (i+1)) / Σ(bin_i)，与 TOPIQ-IAA 同一公式
+/// （[`crate::ai::mos_from_bins`]）。
 pub fn nima_score_from_distribution(dist: &[f32]) -> f32 {
-    let sum: f32 = dist.iter().sum();
-    if sum <= 0.0 {
-        return 5.0; // 默认中间分
-    }
-    let weighted: f32 = dist
-        .iter()
-        .enumerate()
-        .map(|(i, &p)| p * (i as f32 + 1.0))
-        .sum();
-    weighted / sum
+    crate::ai::mos_from_bins(dist)
 }
 
 #[cfg(test)]

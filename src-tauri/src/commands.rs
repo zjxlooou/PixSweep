@@ -119,13 +119,14 @@ pub fn get_thumbnail(path: String, file_hash: String) -> Result<String, String> 
     Ok(crate::cache::thumbnail::to_data_url(&bytes))
 }
 
-/// 获取单张图片的原图（限制最大边 1600px 为 JPEG data URL，用于预览对比）。
+/// 获取单张图片的原图（限制最大边 3072px 为 JPEG data URL，用于预览对比）。
 ///
 /// 大图通过 invoke 返回，避免事件大 payload 导致白屏（沿用 get_thumbnail 的策略）。
 #[tauri::command]
 pub fn get_full_image(path: String) -> Result<String, String> {
     use image::GenericImageView;
 
+    // RAW 全显影输出是传感器原生分辨率（动辄 24MP），预览上限给到 3K 保清晰度
     const MAX_SIDE: u32 = 3072;
     const JPEG_QUALITY: u8 = 92;
 
@@ -566,15 +567,15 @@ pub fn run_scan(
     let group_count = groups.iter().filter(|g| g.len() > 1).count();
     log::info!("[扫描] 聚类完成: {} 组 (重复组 {} 个)", groups.len(), group_count);
 
-    // 4. AI 质量评分（可选）：返回 (综合分, 美学分, 技术分, 人脸专评分, 有人脸标记, 场景, 闭眼)
-    let (scores, aesthetic_scores, technical_scores, face_scores, has_faces, scenes, eye_closed, focus_scores) = if ai_enabled() {
+    // 4. AI 质量评分（可选）：产出全量逐图评分束（综合/美学/技术/人脸/场景/闭眼/对焦）
+    let ai_scores = if ai_enabled() {
         emit(ScanPhase::Quality, 0, groups.len(), None, "");
         #[cfg(feature = "ai")]
         {
             if let Some(engine) = &ai_engine {
                 log::info!("[扫描] AI 双维度评分开始, GPU 加速: {}", engine.gpu_enabled());
                 let ai_start = std::time::Instant::now();
-                let (s, a, t, f, hf, sc, ec, foc) = score_groups_with_ai(db, engine, &infos, &groups, incremental, &emit);
+                let bundle = score_groups_with_ai(db, engine, &infos, &groups, incremental, &emit);
                 log::info!(
                     "[扫描] AI 评分完成, 耗时 {:.1}s (美学+技术+人脸+场景+闭眼+对焦, 增量={})",
                     ai_start.elapsed().as_secs_f64(),
@@ -582,20 +583,20 @@ pub fn run_scan(
                 );
                 let _ = db.flush(); // 落盘评分缓存
                 emit(ScanPhase::Quality, groups.len(), groups.len(), None, "");
-                (s, a, t, f, hf, sc, ec, foc)
+                bundle
             } else {
                 log::warn!("[扫描] AI 引擎未初始化，跳过 AI 评分");
-                empty_scores(infos.len())
+                crate::quality::recommender::AiScoreBundle::empty(infos.len())
             }
         }
         #[cfg(not(feature = "ai"))]
         {
             let _ = &ai_engine;
-            empty_scores(infos.len())
+            crate::quality::recommender::AiScoreBundle::empty(infos.len())
         }
     } else {
         log::info!("[扫描] AI 未启用，跳过质量评分");
-        empty_scores(infos.len())
+        crate::quality::recommender::AiScoreBundle::empty(infos.len())
     };
 
     log_process_mem("scores done (before groups)");
@@ -603,19 +604,8 @@ pub fn run_scan(
     let batch_id = chrono::Local::now().format("%Y%m%d%H%M%S").to_string();
     log::info!("[扫描] 批次号: {}", batch_id);
 
-    let mut image_groups = crate::quality::recommender::build_groups(
-        &infos,
-        &groups,
-        &scores,
-        &aesthetic_scores,
-        &technical_scores,
-        &face_scores,
-        &has_faces,
-        &scenes,
-        &eye_closed,
-        &focus_scores,
-        &batch_id,
-    );
+    let mut image_groups =
+        crate::quality::recommender::build_groups(&infos, &groups, &ai_scores, &batch_id);
 
     // 补充组内平均相似度（用 HashMap 预构建映射，避免 O(M×N) 查找）
     let index_map: std::collections::HashMap<&str, usize> = infos
@@ -704,31 +694,6 @@ pub fn run_scan(
 
 fn ai_enabled() -> bool {
     cfg!(feature = "ai")
-}
-
-/// 构造"AI 未启用 / 引擎缺失"时的空评分占位，与 [`score_groups_with_ai`] 返回结构一致。
-fn empty_scores(
-    len: usize,
-) -> (
-    Vec<Option<f32>>,
-    Vec<Option<f32>>,
-    Vec<Option<f32>>,
-    Vec<Option<f32>>,
-    Vec<bool>,
-    Vec<crate::ai::scene::Scene>,
-    Vec<bool>,
-    Vec<f32>,
-) {
-    (
-        vec![None; len],
-        vec![None; len],
-        vec![None; len],
-        vec![None; len],
-        vec![false; len],
-        vec![crate::ai::scene::Scene::Other; len],
-        vec![false; len],
-        vec![1.0; len],
-    )
 }
 
 /// 计算每张图片的感知哈希（并行 + 增量缓存）。
@@ -824,7 +789,6 @@ fn compute_hashes(
     )
 }
 
-/// 从路径解码图片并计算 dhash、ahash 与尺寸。
 /// 记录当前进程内存（工作集/提交）到日志——定位扫描内存峰值的来源阶段。
 #[cfg(windows)]
 fn log_process_mem(tag: &str) {
@@ -865,6 +829,7 @@ fn trim_working_set() {
 #[cfg(not(windows))]
 fn trim_working_set() {}
 
+/// 从路径解码图片并计算 dhash、ahash 与尺寸。
 fn hash_from_path(path: &str) -> Option<(u64, u64, u32, u32)> {
     // 哈希从统一代理图计算：全库对每张图只做一次全分辨率解码（即生成代理那一次），
     // 哈希/评分/人脸/闭眼/对焦全部只读 ≤2K 代理（2026-08-29 性能改造，
@@ -883,8 +848,78 @@ fn hash_from_path(path: &str) -> Option<(u64, u64, u32, u32)> {
     ))
 }
 
-/// 使用 AI 引擎对组内图片做双维度综合评分（CLIP 美学 + NIMA 技术 + 启发式）。
-/// 返回 (综合分, 美学分, 技术分) 三个数组，分别对应 infos 的索引。
+/// 取一批图片索引对应的源文件路径（扫描各 AI 子阶段的公共小工具）。
+#[cfg(feature = "ai")]
+fn chunk_paths(infos: &[ImageInfo], idxs: &[usize]) -> Vec<String> {
+    idxs.iter().map(|&i| infos[i].path.clone()).collect()
+}
+
+/// 增量模式：装载美学/技术评分缓存，返回需推理的图片索引。
+#[cfg(feature = "ai")]
+fn load_score_caches(
+    db: &crate::db::store::Store,
+    infos: &[ImageInfo],
+    to_score: &[usize],
+    cached_aes: &mut [Option<f32>],
+    cached_tech: &mut [Option<f32>],
+) -> Vec<usize> {
+    let mut need_infer = Vec::new();
+    for &i in to_score {
+        if let Some((a, t)) = db.get_cached_ai_scores(&infos[i].file_hash) {
+            cached_aes[i] = Some(a);
+            cached_tech[i] = Some(t);
+        } else {
+            need_infer.push(i);
+        }
+    }
+    log::info!(
+        "[AI 评分] 增量: 缓存命中 {} 张, 需推理 {} 张",
+        to_score.len() - need_infer.len(),
+        need_infer.len()
+    );
+    need_infer
+}
+
+/// 增量模式：装载人脸/场景/闭眼/对焦缓存，把命中结果写入 `bundle`，返回需重算的图片索引。
+#[cfg(feature = "ai")]
+fn load_face_caches(
+    db: &crate::db::store::Store,
+    infos: &[ImageInfo],
+    to_score: &[usize],
+    bundle: &mut crate::quality::recommender::AiScoreBundle,
+    eye_open_vals: &mut [f32],
+) -> Vec<usize> {
+    let mut need_face = Vec::new();
+    for &i in to_score {
+        if let Some(fc) = db.get_cached_ai_face(&infos[i].file_hash) {
+            bundle.has_face[i] = fc.has_face;
+            bundle.face[i] = fc.face_score;
+            bundle.scenes[i] = crate::ai::scene::Scene::from_u8(fc.scene);
+            eye_open_vals[i] = fc.eye_open;
+            bundle.eye_closed[i] = crate::ai::eye::is_closed(fc.eye_open);
+            bundle.focus[i] = fc.focus_score;
+        } else {
+            need_face.push(i);
+        }
+    }
+    log::info!(
+        "[AI 评分] 人脸/场景/闭眼: 缓存命中 {} 张, 需重算 {} 张",
+        to_score.len() - need_face.len(),
+        need_face.len()
+    );
+    need_face
+}
+
+/// 使用 AI 引擎对组内图片做全链评分，返回 [`crate::quality::recommender::AiScoreBundle`]。
+///
+/// 阶段（与进度条子阶段一一对应）：
+/// 1. **缓存装载**（增量模式）：评分缓存与人脸/场景/闭眼缓存独立判定，命中者跳过推理；
+/// 2. **双缓冲批量推理**：TOPIQ-IAA 美学 + TOPIQ-NR/NIMA 技术（解码与 GPU 推理重叠）；
+/// 3. **场景 ∥ 人脸并发**（M4）：不同 session 可并发 Run，人脸命中覆盖场景为人像；
+/// 4. **闭眼检测**：仅对有人脸的图（脸网格垂目开度 + OCEC 眨眼否决）；
+/// 5. **对焦判断**：人像=眼部对焦，非人像=整图对焦；
+/// 6. **HyperIQA 美学融合**：非人像 50/50 融合（必须逐张，见 [`fuse_hyperiqa_for_non_portrait`]）；
+/// 7. **综合评分**：`composite_scores` 融合启发式，并把各类结果写回缓存。
 #[cfg(feature = "ai")]
 fn score_groups_with_ai(
     db: &crate::db::store::Store,
@@ -893,27 +928,11 @@ fn score_groups_with_ai(
     groups: &[Vec<usize>],
     incremental: bool,
     emit: &impl Fn(ScanPhase, usize, usize, Option<String>, &str),
-) -> (
-    Vec<Option<f32>>,
-    Vec<Option<f32>>,
-    Vec<Option<f32>>,
-    Vec<Option<f32>>,
-    Vec<bool>,
-    Vec<crate::ai::scene::Scene>,
-    Vec<bool>, // is_eye_closed
-    Vec<f32>,  // focus_vals
-) {
-    let mut scores: Vec<Option<f32>> = vec![None; infos.len()];
-    let mut aesthetic: Vec<Option<f32>> = vec![None; infos.len()];
-    let mut technical: Vec<Option<f32>> = vec![None; infos.len()];
-    let mut face_scores: Vec<Option<f32>> = vec![None; infos.len()];
-    let mut has_faces: Vec<bool> = vec![false; infos.len()];
-    let mut scenes: Vec<crate::ai::scene::Scene> = vec![crate::ai::scene::Scene::Other; infos.len()];
-    let mut eye_closed: Vec<bool> = vec![false; infos.len()];
-    // 阶段三：每张图 max(open_l, open_r) ∈ [0,1]（至少一眼开），供综合分连续降权；默认 1.0（不罚）。
+) -> crate::quality::recommender::AiScoreBundle {
+    let mut bundle = crate::quality::recommender::AiScoreBundle::empty(infos.len());
+    // 每张图 max(open_l, open_r) ∈ [0,1]（至少一眼开），供综合分连续降权；默认 1.0（不罚）。
+    // 不进 bundle：综合分输入需要连续概率，分组/展示只需要 eye_closed 布尔。
     let mut eye_open_vals: Vec<f32> = vec![1.0; infos.len()];
-    // 对焦分（人像→眼部对焦，非人像→整图对焦；默认 1.0 不降权）。下方按需填充。
-    let mut focus_vals: Vec<f32> = vec![1.0; infos.len()];
 
     // 收集所有组内图片索引（去重）
     let mut to_score: Vec<usize> = Vec::new();
@@ -922,64 +941,30 @@ fn score_groups_with_ai(
     }
     to_score.sort_unstable();
     to_score.dedup();
-
     if to_score.is_empty() {
-        return (scores, aesthetic, technical, face_scores, has_faces, scenes, eye_closed, focus_vals);
+        return bundle;
     }
 
-    // 增量模式：先查评分缓存，命中者跳过推理（唯一可能变化的是启发式权重，
-    // 它依赖 width/height/size——这些已从缓存记录补齐，与推理结果无关）。
+    // —— 1a. 美学/技术评分缓存（增量模式：命中者跳过推理）——
     let mut cached_aes: Vec<Option<f32>> = vec![None; infos.len()];
     let mut cached_tech: Vec<Option<f32>> = vec![None; infos.len()];
-    let mut need_infer: Vec<usize> = Vec::new();
-    if incremental {
-        for &i in &to_score {
-            if let Some((a, t)) = db.get_cached_ai_scores(&infos[i].file_hash) {
-                cached_aes[i] = Some(a);
-                cached_tech[i] = Some(t);
-            } else {
-                need_infer.push(i);
-            }
-        }
-        log::info!(
-            "[AI 评分] 增量: 缓存命中 {} 张, 需推理 {} 张",
-            to_score.len() - need_infer.len(),
-            need_infer.len()
-        );
+    let need_infer = if incremental {
+        load_score_caches(db, infos, &to_score, &mut cached_aes, &mut cached_tech)
     } else {
-        need_infer = to_score.clone();
-    }
+        to_score.clone()
+    };
 
-    // 阶段一：人脸/场景/闭眼缓存独立判定（与美学/技术分缓存解耦，避免首跑漏算）。
-    // 命中者直接复用 has_face/face_score/scene/eye_closed；未命中者进 need_face 重算。
-    let mut need_face: Vec<usize> = Vec::new();
-    if incremental {
-        for &i in &to_score {
-            if let Some(fc) = db.get_cached_ai_face(&infos[i].file_hash) {
-                has_faces[i] = fc.has_face;
-                face_scores[i] = fc.face_score;
-                scenes[i] = crate::ai::scene::Scene::from_u8(fc.scene);
-                eye_open_vals[i] = fc.eye_open;
-                eye_closed[i] = crate::ai::eye::is_closed(fc.eye_open);
-                focus_vals[i] = fc.focus_score;
-            } else {
-                need_face.push(i);
-            }
-        }
-        log::info!(
-            "[AI 评分] 人脸/场景/闭眼: 缓存命中 {} 张, 需重算 {} 张",
-            to_score.len() - need_face.len(),
-            need_face.len()
-        );
+    // —— 1b. 人脸/场景/闭眼缓存（与评分缓存解耦，避免首跑漏算）——
+    let need_face = if incremental {
+        load_face_caches(db, infos, &to_score, &mut bundle, &mut eye_open_vals)
     } else {
-        need_face = to_score.clone();
-    }
+        to_score.clone()
+    };
 
-    // 分批推理：双缓冲流水线（producer 用 rayon 并行预处理下一批 tensor，consumer 用
-    // 现有单 session 逐张推理 → 解码与 GPU 推理重叠）。批内顺序、模型调用顺序、
-    // session 串行语义不变 → 分数确定性不变。
+    // —— 2. 双缓冲流水线：producer 并行预处理下一批 tensor，consumer 逐批推理 ——
+    // 批内顺序、模型调用顺序、session 串行语义不变 → 分数确定性不变。
     const BATCH: usize = 16;
-    let need_paths: Vec<String> = need_infer.iter().map(|&i| infos[i].path.clone()).collect();
+    let need_paths = chunk_paths(infos, &need_infer);
     let mut progress = |done: usize, total: usize| emit(ScanPhase::Quality, done, total, None, "");
     let (batch_aes, batch_tech, timing) =
         crate::ai::engine::score_batch_scores(engine, &need_paths, BATCH, &mut progress);
@@ -991,240 +976,57 @@ fn score_groups_with_ai(
     );
 
     for (j, &idx) in need_infer.iter().enumerate() {
-        let a = batch_aes.get(j).copied().flatten();
-        let t = batch_tech.get(j).copied().flatten();
-        cached_aes[idx] = a;
-        cached_tech[idx] = t;
+        cached_aes[idx] = batch_aes.get(j).copied().flatten();
+        cached_tech[idx] = batch_tech.get(j).copied().flatten();
         // 写回评分缓存（增量模式下下次命中）
-        let _ = db.save_ai_scores(&infos[idx].file_hash, a, t);
+        let _ = db.save_ai_scores(&infos[idx].file_hash, cached_aes[idx], cached_tech[idx]);
     }
 
-    log_process_mem("hash+cluster done");
+    log_process_mem("aesthetic+technical done");
 
-    // 场景分类（MobileNetV3）：只对需要重算的图片分类。
-    // M4 并发：场景与人脸专评用不同 session（可并发 Run），两者计算独立——
-    // 场景结果写入独立缓冲 scene_raw，人脸阶段结束后再合并（人像覆盖）。
-
-    log_process_mem("scene done");
-
-    // M4 并发：场景分类线程（与人脸专评同时跑，不同 session 互不阻塞）。
-    // scope 线程借用本函数局部数据，作用域覆盖场景 spawn + 人脸块 + 合并。
+    // —— 3. 场景分类 ∥ 人脸专评（M4 并发：不同 session 可并发 Run，计算相互独立）——
+    // 场景结果写入独立缓冲，人脸阶段结束后合并（人脸命中覆盖场景为人像）。
     let scene_start = std::time::Instant::now();
     std::thread::scope(|scope| {
-    let scene_thread = if engine.scene_scoring_available() && !need_face.is_empty() {
-        let need_face_ref: &[usize] = &need_face;
-        let infos_ref: &[ImageInfo] = infos;
-        let engine_ref: &crate::ai::engine::AiEngine = engine;
-        Some(scope.spawn(move || {
-                let mut raw = vec![crate::ai::scene::Scene::Other; infos_ref.len()];
-                const CHUNK: usize = 64;
-                for chunk in need_face_ref.chunks(CHUNK) {
-                    let cpaths: Vec<String> =
-                        chunk.iter().map(|&i| infos_ref[i].path.clone()).collect();
-                    let classified = engine_ref.scene_scores(&cpaths);
-                    for (k, &idx) in chunk.iter().enumerate() {
-                        if let Some(sc) = classified.get(k).copied() {
-                            raw[idx] = sc;
-                        }
-                    }
-                }
-                (raw, 0, 0)
-        }))
-    } else {
-        None
-    };
-
-    // 人脸专评：仅对需要重算的图片（增量模式未命中人脸缓存者）做检测 + TOPIQ-NR-Face。
-    // 逐块检测并推送进度，避免子阶段内进度条不动。
-    if engine.face_scoring_available() && !need_face.is_empty() {
-        const CHUNK: usize = 64;
-        let face_start = std::time::Instant::now();
-        emit(ScanPhase::Quality, 0, need_face.len(), None, "识别面部");
-        let mut done = 0usize;
-        let mut has_face_total = 0usize;
-        for chunk in need_face.chunks(CHUNK) {
-            let cpaths: Vec<String> = chunk.iter().map(|&i| infos[i].path.clone()).collect();
-            let (f_scores, f_has) = engine.face_scores(&cpaths);
-            for (k, &idx) in chunk.iter().enumerate() {
-                face_scores[idx] = f_scores.get(k).copied().flatten();
-                has_faces[idx] = f_has.get(k).copied().unwrap_or(false);
-                if has_faces[idx] {
-                    scenes[idx] = crate::ai::scene::Scene::Portrait;
-                }
-            }
-            has_face_total += f_has.iter().filter(|&&v| v).count();
-            done += chunk.len();
-            emit(ScanPhase::Quality, done, need_face.len(), None, "识别面部");
+        let scene_thread = spawn_scene_thread(scope, engine, infos, &need_face);
+        run_face_phase(engine, infos, &need_face, &mut bundle, emit);
+        log_process_mem("face done");
+        if let Some(handle) = scene_thread {
+            merge_scene_results(handle, &need_face, &mut bundle, scene_start.elapsed());
         }
-        log::info!(
-            "[AI 评分] 人脸专评完成, 耗时 {:.1}s (检测 {} 张, 有人脸 {} 张)",
-            face_start.elapsed().as_secs_f64(),
-            need_face.len(),
-            has_face_total
-        );
-    }
-
-    log_process_mem("face done");
-
-    // M4：等待并发场景分类完成并合并（人像覆盖：has_faces 已由人脸阶段写入）
-    if let Some(handle) = scene_thread {
-        let (raw, mut pet, mut landscape) = match handle.join() {
-            Ok(v) => v,
-            Err(e) => {
-                log::warn!("[AI 评分] 场景分类线程失败: {e:?}");
-                (Vec::new(), 0, 0)
-            }
-        };
-        for &idx in &need_face {
-            if !has_faces[idx] {
-                match raw.get(idx).copied().unwrap_or(crate::ai::scene::Scene::Other) {
-                    crate::ai::scene::Scene::Pet => {
-                        pet += 1;
-                        scenes[idx] = crate::ai::scene::Scene::Pet;
-                    }
-                    crate::ai::scene::Scene::Landscape => {
-                        landscape += 1;
-                        scenes[idx] = crate::ai::scene::Scene::Landscape;
-                    }
-                    other => scenes[idx] = other,
-                }
-            }
-        }
-        log::info!(
-            "[AI 评分] 场景分类完成(与人脸并发 {:.1}s), 宠物 {} 张, 风景 {} 张",
-            scene_start.elapsed().as_secs_f64(),
-            pet,
-            landscape
-        );
-    }
     });
 
-    // 闭眼检测（OCEC）：仅对有脸的图做（人像场景才有意义）。返回 max(open_l, open_r)。
-    // 只在检测到的人脸图上逐块推进度。
-    if engine.eye_status_available() {
-        const CHUNK: usize = 64;
-        let face_idxs: Vec<usize> = need_face.iter().copied().filter(|&i| has_faces[i]).collect();
-        let face_cnt = face_idxs.len();
-        if face_cnt > 0 {
-            emit(ScanPhase::Quality, 0, face_cnt, None, "识别眼部");
-            let mut done = 0usize;
-            let eye_start = std::time::Instant::now();
-            let mut closed_count = 0usize;
-            for chunk in face_idxs.chunks(CHUNK) {
-                let cpaths: Vec<String> = chunk.iter().map(|&i| infos[i].path.clone()).collect();
-                let chas = vec![true; chunk.len()];
-                let opens = engine.eye_open_probs(&cpaths, &chas);
-                for (k, &idx) in chunk.iter().enumerate() {
-                    let open = opens.get(k).copied().unwrap_or(1.0);
-                    eye_open_vals[idx] = open;
-                    let closed = crate::ai::eye::is_closed(open);
-                    eye_closed[idx] = closed;
-                    if closed {
-                        closed_count += 1;
-                    }
-                }
-                done += chunk.len();
-                emit(ScanPhase::Quality, done, face_cnt, None, "识别眼部");
-            }
-            log::info!(
-                "[AI 评分] 闭眼检测完成, 耗时 {:.1}s (识别眼部 {} 张, 闭眼 {} 张)",
-                eye_start.elapsed().as_secs_f64(),
-                face_cnt,
-                closed_count
-            );
-        }
-    }
-
+    // —— 4. 闭眼检测（脸网格垂目开度 + OCEC 眨眼否决）——
+    let eye_open_vals = run_eye_phase(engine, infos, &need_face, &mut bundle, emit);
     log_process_mem("eye done");
 
-    // 对焦分：人像→眼部对焦，非人像→整图对焦。仅对未命中缓存的 need_face 计算，
-    // 命中者已从 AiFaceCache 恢复 focus_score。逐块推进度。
-    if !need_face.is_empty() {
-        const CHUNK: usize = 64;
-        emit(ScanPhase::Quality, 0, need_face.len(), None, "对焦判断");
-        let mut done = 0usize;
-        for chunk in need_face.chunks(CHUNK) {
-            let cpaths: Vec<String> = chunk.iter().map(|&i| infos[i].path.clone()).collect();
-            let chas: Vec<bool> = chunk.iter().map(|&i| has_faces[i]).collect();
-            let f_scores = engine.focus_scores(&cpaths, &chas);
-            for (k, &idx) in chunk.iter().enumerate() {
-                focus_vals[idx] = f_scores.get(k).copied().unwrap_or(1.0);
-            }
-            done += chunk.len();
-            emit(ScanPhase::Quality, done, need_face.len(), None, "对焦判断");
-        }
-    }
-
+    // —— 5. 对焦判断 ——
+    run_focus_phase(engine, infos, &need_face, &mut bundle, emit);
     log_process_mem("focus done");
 
-    // 非人像美学融合：场景判定完成后，对非人像的新评图用 HyperIQA 与 TOPIQ-IAA
-    // 做 50/50 融合——hyperiqa 对风景/宠物/食物的降级敏感度更强（357 张基准
-    // Cohen's d=1.20），但人像偏置重，故人像不启用。融合值重写回评分缓存。
-    if engine.has_hyperiqa() && engine.has_topiq_iia() {
-        let targets: Vec<usize> = need_infer
-            .iter()
-            .copied()
-            .filter(|&i| scenes[i] != crate::ai::scene::Scene::Portrait)
-            .collect();
-        if !targets.is_empty() {
-            let fuse_start = std::time::Instant::now();
-            emit(ScanPhase::Quality, 0, targets.len(), None, "美学融合");
-            // **必须逐张推理**：HyperIQA 是 fix batch=1 导出，批量输入会静默产生
-            // 错误结果，且其密集层中间张量随 batch 线性膨胀——batch=16 单次 run
-            // 实测触碰 3.2GB 主机内存（2026-08-29 内存排查）。
-            for (done, &idx) in targets.iter().enumerate() {
-                let cpaths = vec![infos[idx].path.clone()];
-                match crate::ai::preprocess::images_to_batch_raw01_512(&cpaths) {
-                    Ok(batch) => match engine.hyperiqa_scores(&batch) {
-                        Ok(hs) => {
-                            if let (Some(h), Some(iaa)) = (hs.first().copied(), cached_aes[idx]) {
-                                let mapped = crate::ai::engine::HYPERIQA_CAL_A * h
-                                    + crate::ai::engine::HYPERIQA_CAL_B;
-                                let fused = (crate::ai::engine::HYPERIQA_FUSION_WEIGHT * iaa
-                                    + (1.0 - crate::ai::engine::HYPERIQA_FUSION_WEIGHT) * mapped)
-                                    .clamp(1.0, 10.0);
-                                cached_aes[idx] = Some(fused);
-                            }
-                        }
-                        Err(e) => log::warn!("[AI 评分] HyperIQA 推理失败: {}", e),
-                    },
-                    Err(e) => log::warn!("[AI 评分] HyperIQA 预处理失败: {}", e),
-                }
-                emit(
-                    ScanPhase::Quality,
-                    done + 1,
-                    targets.len(),
-                    None,
-                    "美学融合",
-                );
-            }
-            // 融合后的美学分重写回缓存（save_ai_scores 仅覆盖 Some 字段）
-            for &idx in &targets {
-                let _ =
-                    db.save_ai_scores(&infos[idx].file_hash, cached_aes[idx], cached_tech[idx]);
-            }
-            log::info!(
-                "[AI 评分] HyperIQA 非人像美学融合: {} 张, 耗时 {:.1}s",
-                targets.len(),
-                fuse_start.elapsed().as_secs_f64()
-            );
-        }
-    }
-
+    // —— 6. 非人像 HyperIQA 美学融合 ——
+    fuse_hyperiqa_for_non_portrait(
+        db,
+        engine,
+        infos,
+        &need_infer,
+        &mut cached_aes,
+        &cached_tech,
+        &bundle,
+        emit,
+    );
     log_process_mem("hyperiqa done");
 
-    // 综合评分：用缓存/推理结果 + 启发式（权重依赖尺寸，与哈希缓存一致）
-    let cached_aes_arr = cached_aes;
-    let cached_tech_arr = cached_tech;
+    // —— 7. 综合评分：缓存/推理结果 + 启发式（权重依赖尺寸，与哈希缓存一致）——
     let widths: Vec<u32> = infos.iter().map(|i| i.width).collect();
     let heights: Vec<u32> = infos.iter().map(|i| i.height).collect();
     let sizes: Vec<u64> = infos.iter().map(|i| i.size).collect();
     let comp = engine.composite_scores(
-        Some(&cached_aes_arr.iter().map(|o| o.unwrap_or(0.0)).collect::<Vec<_>>()),
-        Some(&focus_vals),
-        Some(&face_scores.iter().map(|o| o.unwrap_or(0.0)).collect::<Vec<_>>()),
-        &has_faces,
-        &scenes,
+        Some(&cached_aes.iter().map(|o| o.unwrap_or(0.0)).collect::<Vec<_>>()),
+        Some(&bundle.focus),
+        Some(&bundle.face.iter().map(|o| o.unwrap_or(0.0)).collect::<Vec<_>>()),
+        &bundle.has_face,
+        &bundle.scenes,
         &eye_open_vals,
         &widths,
         &heights,
@@ -1233,16 +1035,14 @@ fn score_groups_with_ai(
     log_process_mem("composite done");
     match comp {
         Ok(s) if !s.is_empty() => {
-            // 【修复】s 是全长数组（宽度 = infos.len()），须用图片索引 idx 取值，
+            // s 是全长数组（宽度 = infos.len()），须用图片索引 idx 取值，
             // 而非 to_score 内的位置 i。此前用 s.get(i) 在 to_score 非连续
             // （含未入组的唯一图）时会错位，导致推荐分写错。
             for &idx in &to_score {
-                scores[idx] = s.get(idx).copied().or_else(|| cached_aes_arr[idx].map(|_| 5.0));
+                bundle.composite[idx] = s.get(idx).copied().or_else(|| cached_aes[idx].map(|_| 5.0));
             }
-            for &idx in &to_score {
-                aesthetic[idx] = cached_aes_arr[idx];
-                technical[idx] = cached_tech_arr[idx];
-            }
+            bundle.aesthetic = cached_aes;
+            bundle.technical = cached_tech;
         }
         Ok(_) => {
             log::warn!("综合评分返回空，本批使用启发式推荐");
@@ -1250,7 +1050,7 @@ fn score_groups_with_ai(
         Err(e) => log::warn!("综合评分失败: {}", e),
     }
 
-    // 阶段一：写回人脸/场景/闭眼缓存（hash 未变，下次增量扫描直接命中）。
+    // 写回人脸/场景/闭眼缓存（hash 未变，下次增量扫描直接命中）。
     // 非增量模式也会写，使紧随其后的增量重扫受益。
     // 仅当三类模型都真正产出结果时才写——若任一模型缺失，has_face/scene/eye_closed
     // 是默认占位值，写回会把"假结果"持久化成有效缓存，日后模型补齐也会被静默复用。
@@ -1261,16 +1061,257 @@ fn score_groups_with_ai(
         for &idx in &need_face {
             let _ = db.save_ai_face(
                 &infos[idx].file_hash,
-                has_faces[idx],
-                face_scores[idx],
-                scenes[idx] as u8,
+                bundle.has_face[idx],
+                bundle.face[idx],
+                bundle.scenes[idx] as u8,
                 eye_open_vals[idx],
-                focus_vals[idx],
+                bundle.focus[idx],
             );
         }
     }
 
-    (scores, aesthetic, technical, face_scores, has_faces, scenes, eye_closed, focus_vals)
+    bundle
+}
+
+/// M4 场景分类线程：把待重算图片分块送 MobileNetV3（与人脸专评并发，不同 session
+/// 互不阻塞），返回逐图场景缓冲（人脸覆盖前的原始分类）。
+#[cfg(feature = "ai")]
+fn spawn_scene_thread<'scope, 'env>(
+    scope: &'scope std::thread::Scope<'scope, 'env>,
+    engine: &'scope crate::ai::engine::AiEngine,
+    infos: &'scope [ImageInfo],
+    need_face: &'scope [usize],
+) -> Option<std::thread::ScopedJoinHandle<'scope, Vec<crate::ai::scene::Scene>>> {
+    if !engine.scene_scoring_available() || need_face.is_empty() {
+        return None;
+    }
+    Some(scope.spawn(move || {
+        let mut raw = vec![crate::ai::scene::Scene::Other; infos.len()];
+        const CHUNK: usize = 64;
+        for chunk in need_face.chunks(CHUNK) {
+            let classified = engine.scene_scores(&chunk_paths(infos, chunk));
+            for (k, &idx) in chunk.iter().enumerate() {
+                if let Some(sc) = classified.get(k).copied() {
+                    raw[idx] = sc;
+                }
+            }
+        }
+        raw
+    }))
+}
+
+/// 等待场景线程完成并把结果合并进 `bundle`：人脸已命中的图保持人像不被覆盖，
+/// 其余图采用场景分类结果，并统计宠物/风景张数打日志。
+#[cfg(feature = "ai")]
+fn merge_scene_results(
+    handle: std::thread::ScopedJoinHandle<'_, Vec<crate::ai::scene::Scene>>,
+    need_face: &[usize],
+    bundle: &mut crate::quality::recommender::AiScoreBundle,
+    elapsed: std::time::Duration,
+) {
+    let raw = match handle.join() {
+        Ok(v) => v,
+        Err(e) => {
+            log::warn!("[AI 评分] 场景分类线程失败: {e:?}");
+            return;
+        }
+    };
+    let (mut pet, mut landscape) = (0usize, 0usize);
+    for &idx in need_face {
+        if bundle.has_face[idx] {
+            continue; // 人脸已判定为人像，场景分类结果让位
+        }
+        match raw.get(idx).copied().unwrap_or(crate::ai::scene::Scene::Other) {
+            crate::ai::scene::Scene::Pet => {
+                pet += 1;
+                bundle.scenes[idx] = crate::ai::scene::Scene::Pet;
+            }
+            crate::ai::scene::Scene::Landscape => {
+                landscape += 1;
+                bundle.scenes[idx] = crate::ai::scene::Scene::Landscape;
+            }
+            other => bundle.scenes[idx] = other,
+        }
+    }
+    log::info!(
+        "[AI 评分] 场景分类完成(与人脸并发 {:.1}s), 宠物 {} 张, 风景 {} 张",
+        elapsed.as_secs_f64(),
+        pet,
+        landscape
+    );
+}
+
+/// 人脸专评阶段：分块检测 + TOPIQ-NR-Face 推理，结果写入 `bundle`
+/// （人脸命中把场景覆盖为人像）。逐块推进度，避免子阶段内进度条不动。
+#[cfg(feature = "ai")]
+fn run_face_phase(
+    engine: &crate::ai::engine::AiEngine,
+    infos: &[ImageInfo],
+    need_face: &[usize],
+    bundle: &mut crate::quality::recommender::AiScoreBundle,
+    emit: &impl Fn(ScanPhase, usize, usize, Option<String>, &str),
+) {
+    if !engine.face_scoring_available() || need_face.is_empty() {
+        return;
+    }
+    const CHUNK: usize = 64;
+    let face_start = std::time::Instant::now();
+    emit(ScanPhase::Quality, 0, need_face.len(), None, "识别面部");
+    let mut done = 0usize;
+    let mut has_face_total = 0usize;
+    for chunk in need_face.chunks(CHUNK) {
+        let (f_scores, f_has) = engine.face_scores(&chunk_paths(infos, chunk));
+        for (k, &idx) in chunk.iter().enumerate() {
+            bundle.face[idx] = f_scores.get(k).copied().flatten();
+            bundle.has_face[idx] = f_has.get(k).copied().unwrap_or(false);
+            if bundle.has_face[idx] {
+                bundle.scenes[idx] = crate::ai::scene::Scene::Portrait;
+            }
+        }
+        has_face_total += f_has.iter().filter(|&&v| v).count();
+        done += chunk.len();
+        emit(ScanPhase::Quality, done, need_face.len(), None, "识别面部");
+    }
+    log::info!(
+        "[AI 评分] 人脸专评完成, 耗时 {:.1}s (检测 {} 张, 有人脸 {} 张)",
+        face_start.elapsed().as_secs_f64(),
+        need_face.len(),
+        has_face_total
+    );
+}
+
+/// 闭眼检测阶段：仅对有人脸的图跑（脸网格垂目开度 + OCEC 眨眼否决），
+/// 写 `bundle.eye_closed`，返回逐图开眼概率（综合分连续降权输入）。
+#[cfg(feature = "ai")]
+fn run_eye_phase(
+    engine: &crate::ai::engine::AiEngine,
+    infos: &[ImageInfo],
+    need_face: &[usize],
+    bundle: &mut crate::quality::recommender::AiScoreBundle,
+    emit: &impl Fn(ScanPhase, usize, usize, Option<String>, &str),
+) -> Vec<f32> {
+    let mut eye_open_vals = vec![1.0f32; infos.len()];
+    if !engine.eye_status_available() {
+        return eye_open_vals;
+    }
+    const CHUNK: usize = 64;
+    let face_idxs: Vec<usize> = need_face.iter().copied().filter(|&i| bundle.has_face[i]).collect();
+    if face_idxs.is_empty() {
+        return eye_open_vals;
+    }
+    emit(ScanPhase::Quality, 0, face_idxs.len(), None, "识别眼部");
+    let eye_start = std::time::Instant::now();
+    let mut done = 0usize;
+    let mut closed_count = 0usize;
+    for chunk in face_idxs.chunks(CHUNK) {
+        let chas = vec![true; chunk.len()];
+        let opens = engine.eye_open_probs(&chunk_paths(infos, chunk), &chas);
+        for (k, &idx) in chunk.iter().enumerate() {
+            let open = opens.get(k).copied().unwrap_or(1.0);
+            eye_open_vals[idx] = open;
+            let closed = crate::ai::eye::is_closed(open);
+            bundle.eye_closed[idx] = closed;
+            closed_count += closed as usize;
+        }
+        done += chunk.len();
+        emit(ScanPhase::Quality, done, face_idxs.len(), None, "识别眼部");
+    }
+    log::info!(
+        "[AI 评分] 闭眼检测完成, 耗时 {:.1}s (识别眼部 {} 张, 闭眼 {} 张)",
+        eye_start.elapsed().as_secs_f64(),
+        face_idxs.len(),
+        closed_count
+    );
+    eye_open_vals
+}
+
+/// 对焦阶段：人像→眼部对焦，非人像→整图对焦，结果写 `bundle.focus`。
+/// 仅对未命中人脸缓存的图片计算（命中者已从缓存恢复）。
+#[cfg(feature = "ai")]
+fn run_focus_phase(
+    engine: &crate::ai::engine::AiEngine,
+    infos: &[ImageInfo],
+    need_face: &[usize],
+    bundle: &mut crate::quality::recommender::AiScoreBundle,
+    emit: &impl Fn(ScanPhase, usize, usize, Option<String>, &str),
+) {
+    if need_face.is_empty() {
+        return;
+    }
+    const CHUNK: usize = 64;
+    emit(ScanPhase::Quality, 0, need_face.len(), None, "对焦判断");
+    let mut done = 0usize;
+    for chunk in need_face.chunks(CHUNK) {
+        let chas: Vec<bool> = chunk.iter().map(|&i| bundle.has_face[i]).collect();
+        let f_scores = engine.focus_scores(&chunk_paths(infos, chunk), &chas);
+        for (k, &idx) in chunk.iter().enumerate() {
+            bundle.focus[idx] = f_scores.get(k).copied().unwrap_or(1.0);
+        }
+        done += chunk.len();
+        emit(ScanPhase::Quality, done, need_face.len(), None, "对焦判断");
+    }
+}
+
+/// 非人像美学融合：对非人像的新评图用 HyperIQA 与 TOPIQ-IAA 做 50/50 融合，
+/// 融合值重写回评分缓存。hyperiqa 对风景/宠物/食物的降级敏感度更强（357 张基准
+/// Cohen's d=1.20），但人像偏置重，故人像不启用。
+#[cfg(feature = "ai")]
+#[allow(clippy::too_many_arguments)]
+fn fuse_hyperiqa_for_non_portrait(
+    db: &crate::db::store::Store,
+    engine: &crate::ai::engine::AiEngine,
+    infos: &[ImageInfo],
+    need_infer: &[usize],
+    cached_aes: &mut [Option<f32>],
+    cached_tech: &[Option<f32>],
+    bundle: &crate::quality::recommender::AiScoreBundle,
+    emit: &impl Fn(ScanPhase, usize, usize, Option<String>, &str),
+) {
+    if !(engine.has_hyperiqa() && engine.has_topiq_iia()) {
+        return;
+    }
+    let targets: Vec<usize> = need_infer
+        .iter()
+        .copied()
+        .filter(|&i| bundle.scenes[i] != crate::ai::scene::Scene::Portrait)
+        .collect();
+    if targets.is_empty() {
+        return;
+    }
+    let fuse_start = std::time::Instant::now();
+    emit(ScanPhase::Quality, 0, targets.len(), None, "美学融合");
+    // **必须逐张推理**：HyperIQA 是 fix batch=1 导出，批量输入会静默产生
+    // 错误结果，且其密集层中间张量随 batch 线性膨胀——batch=16 单次 run
+    // 实测触碰 3.2GB 主机内存（2026-08-29 内存排查）。
+    for (done, &idx) in targets.iter().enumerate() {
+        let cpaths = vec![infos[idx].path.clone()];
+        match crate::ai::preprocess::images_to_batch_raw01_512(&cpaths) {
+            Ok(batch) => match engine.hyperiqa_scores(&batch) {
+                Ok(hs) => {
+                    if let (Some(h), Some(iaa)) = (hs.first().copied(), cached_aes[idx]) {
+                        let mapped = crate::ai::engine::HYPERIQA_CAL_A * h
+                            + crate::ai::engine::HYPERIQA_CAL_B;
+                        let fused = (crate::ai::engine::HYPERIQA_FUSION_WEIGHT * iaa
+                            + (1.0 - crate::ai::engine::HYPERIQA_FUSION_WEIGHT) * mapped)
+                            .clamp(1.0, 10.0);
+                        cached_aes[idx] = Some(fused);
+                    }
+                }
+                Err(e) => log::warn!("[AI 评分] HyperIQA 推理失败: {}", e),
+            },
+            Err(e) => log::warn!("[AI 评分] HyperIQA 预处理失败: {}", e),
+        }
+        emit(ScanPhase::Quality, done + 1, targets.len(), None, "美学融合");
+    }
+    // 融合后的美学分重写回缓存（save_ai_scores 仅覆盖 Some 字段）
+    for &idx in &targets {
+        let _ = db.save_ai_scores(&infos[idx].file_hash, cached_aes[idx], cached_tech[idx]);
+    }
+    log::info!(
+        "[AI 评分] HyperIQA 非人像美学融合: {} 张, 耗时 {:.1}s",
+        targets.len(),
+        fuse_start.elapsed().as_secs_f64()
+    );
 }
 
 // ---- 缓存清理（移入系统回收站，可恢复） ----

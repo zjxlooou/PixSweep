@@ -20,7 +20,7 @@ fn main() {
     let model_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("models")
         .join("insightface");
-    let eng = InsightFaceEngine::new();
+    let mut eng = InsightFaceEngine::new();
     if let Err(err) = eng.load(&model_dir, false) {
         eprintln!("[bbox] InsightFace 加载失败: {err}");
         std::process::exit(1);

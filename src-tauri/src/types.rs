@@ -75,9 +75,9 @@ pub struct GroupImage {
     pub info: ImageInfo,
     /// 综合评分（1.0 ~ 10.0），未启用 AI 时为 None
     pub score: Option<f32>,
-    /// CLIP 美学评分（1.0 ~ 10.0），美学头缺失时为 None
+    /// 美学评分（1.0 ~ 10.0，TOPIQ-IAA ⊕ HyperIQA），美学模型缺失时为 None
     pub aesthetic_score: Option<f32>,
-    /// NIMA 技术质量评分（1.0 ~ 10.0），技术模型缺失时为 None
+    /// 技术质量评分（1.0 ~ 10.0，TOPIQ-NR），技术模型缺失时为 None
     pub technical_score: Option<f32>,
     /// TOPIQ-NR-Face 人脸专评（1.0 ~ 10.0），无人脸或未启用时为 None
     #[serde(default)]

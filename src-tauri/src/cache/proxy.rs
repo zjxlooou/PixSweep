@@ -168,7 +168,7 @@ pub fn proxy_cache_files() -> Vec<std::path::PathBuf> {
 // ---- 缓存目录小工具 ----
 
 /// 目录内文件总字节数。
-fn cache_dir_bytes(dir: &PathBuf) -> u64 {
+fn cache_dir_bytes(dir: &std::path::Path) -> u64 {
     let Ok(entries) = std::fs::read_dir(dir) else {
         return 0;
     };
@@ -180,7 +180,7 @@ fn cache_dir_bytes(dir: &PathBuf) -> u64 {
 }
 
 /// 目录内全部文件路径。
-fn cache_dir_files(dir: &PathBuf) -> Vec<std::path::PathBuf> {
+fn cache_dir_files(dir: &std::path::Path) -> Vec<std::path::PathBuf> {
     let Ok(entries) = std::fs::read_dir(dir) else {
         return Vec::new();
     };

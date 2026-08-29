@@ -73,7 +73,7 @@ export function PreviewModal({
   // 右键菜单
   const [menu, setMenu] = useState<MenuPos | null>(null);
 
-  // 缩放/拖动状态（scale=1 表示 CSS 填满容器，Ctrl+滚轮在基础上叠加）
+  // 缩放/拖动状态（scale=1 表示 CSS 填满容器，滚轮缩放在基础上叠加）
   const [scale, setScale] = useState(1);
   const [pan, setPan] = useState({ x: 0, y: 0 });
   const [isDragging, setIsDragging] = useState(false);
@@ -418,7 +418,7 @@ export function PreviewModal({
                   className={`preview-image ${isDragging ? "dragging" : ""}`}
                   style={{
                     // scale=1 时不加 transform：由 CSS object-fit: contain 填满容器（稳定）
-                    // scale>1 时叠加平移+缩放（用户 Ctrl+滚轮）
+                    // scale>1 时叠加平移+缩放（用户滚轮缩放/拖拽平移）
                     transform:
                       scale > 1
                         ? `translate(${pan.x}px, ${pan.y}px) scale(${scale})`

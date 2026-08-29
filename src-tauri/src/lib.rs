@@ -22,8 +22,8 @@
 //! - [`commands`]：Tauri IPC 命令（前端调用入口）。
 //!
 //! ## 关键约定
-//! - 推理后端走 **DirectML**（Windows DirectX 12，全 GPU 通用，不依赖 CUDA），
-//!   不兼容的模型自动回退 CPU EP。
+//! - 推理后端按 **CUDA → DirectML → CPU** 三级回退（CUDA 需驱动级检测到 NVIDIA GPU），
+//!   会话创建失败自动降级。
 //! - 模型文件放在可执行文件同级的 `models/` 目录（见 [`models_dir`]）。
 
 pub mod cache;
@@ -46,8 +46,7 @@ use std::io::Write;
 use std::path::PathBuf;
 use tauri::Manager;
 
-/// 返回应用数据目录（如 `%LOCALAPPDATA%/PixSweep`），不存在则创建。
-/// 可执行文件所在目录（程序根目录）。
+/// 返回应用数据目录（程序根目录，exe 同级），不存在则创建。
 fn exe_dir() -> PathBuf {
     std::env::current_exe()
         .ok()
@@ -80,7 +79,7 @@ pub fn models_dir() -> PathBuf {
 }
 
 // ---------------------------------------------------------------------------
-// 文件日志：写入 %LOCALAPPDATA%/PixSweep/pixsweep.log
+// 文件日志：写入程序根目录（app_data_dir）的 pixsweep.log
 // GUI release 版无控制台窗口，必须落盘才能排查问题。
 // ---------------------------------------------------------------------------
 
@@ -118,7 +117,7 @@ impl log::Log for FileLogger {
 
 /// 初始化日志：
 /// - 若设置了 `RUST_LOG`（开发调试），用 env_logger 输出到控制台；
-/// - 否则（用户正常使用）写入 `%LOCALAPPDATA%/PixSweep/pixsweep.log`，级别 Info。
+/// - 否则（用户正常使用）写入程序根目录 `pixsweep.log`，级别 Info。
 pub fn init_logging() {
     if std::env::var("RUST_LOG").is_ok() {
         let _ = env_logger::Builder::from_default_env().try_init();

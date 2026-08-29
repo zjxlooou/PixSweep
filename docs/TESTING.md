@@ -30,15 +30,15 @@
 cd src-tauri && cargo test
 ```
 
-覆盖：感知哈希（hashing）、双哈希聚类（cluster）、TOPIQ/NIMA 评分（ai/topiq、ai/nima）、推荐（quality）。
+覆盖：感知哈希（hashing）、双哈希聚类（cluster）、TOPIQ/NIMA 评分（ai/topiq、ai/nima）、推荐（quality）、代理规格（cache/proxy）、硬件分档（ai/hardware）。
 
-**预期**：`test result: ok. 37 passed; 0 failed`
+**预期**：`test result: ok. 46 passed; 0 failed`（以当前代码为准，新增模块时同步此数）
 
 ## 2. 前端组件测试
 
 ```bash
-# 必须在项目子目录运行（vitest 4.x 在外层 workspace 根找不到 jsdom）
-cd PixSweep && npx vitest run
+# 在仓库根目录运行
+npx vitest run
 ```
 
 覆盖 DeleteConfirmModal（键盘）、GroupCard（渲染）、formatBytes（纯函数）。
@@ -140,6 +140,16 @@ cd src-tauri && cargo build --release      # 后
 **症状**：增量编译报"拒绝访问"。
 
 **修复**：删除 `target/` 后全量重建。（历史注：旧 agent 沙箱环境会污染 target 的 ACL 导致此症状；现环境无沙箱，若重现多为文件占用或权限问题。）
+
+### 2b. cargo test 并行构建竞态（2026-08-29 记录）
+
+**症状**：`cargo test`（默认 -j 并行）在 example/bin 单元报 `E0462 found staticlib
+xxx.dll.lib` / `E0786 invalid metadata` / `E0463 can't find crate`，失败点在依赖间"漂移"，
+全删 `target/debug` 重建后依旧；`cargo check --all-targets` 与 `cargo test --lib` 均正常。
+
+**修复（已验证）**：`cargo test -j 1` 串行构建全量通过（46 lib + bin + 全部 examples）。
+日常验证优先用 `cargo test --lib`（单测全部在 lib）；需要 example 链接验证时用
+`cargo test -j 1` 或 `cargo build --all-targets`。
 
 ### 3. 路径格式
 

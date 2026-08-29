@@ -116,11 +116,33 @@ pub struct AiEngine {
 }
 
 impl AiEngine {
-    /// 初始化引擎：优先 DirectML，失败回退 CPU。
-    /// 加载顺序：TOPIQ-NR/IAA（主）→ NIMA 技术质量（后备，可选）。
-    pub fn new(model_dir: &std::path::Path) -> anyhow::Result<Self> {
-        let tech_path = model_dir.join(NIMA_TECH_MODEL);
+    /// 尝试加载单个可选模型会话：文件存在则按三级回退构建；缺失/失败仅告警并返回
+    /// None（模型缺失不报错是既定约定，对应能力自动跳过）。
+    /// 成功时同时返回所用后端，调用方决定是否采纳为引擎后端。
+    fn load_optional_session(
+        path: &std::path::Path,
+        capability: &str,
+    ) -> Option<(parking_lot::Mutex<Session>, GpuBackend)> {
+        if !path.exists() {
+            log::warn!("{} 模型不存在，跳过对应能力: {}", capability, path.display());
+            return None;
+        }
+        log::info!("{} 模型存在: {}", capability, path.display());
+        match Self::build_session(path, false) {
+            Ok((s, be)) => {
+                log::info!("{} 会话就绪，推理后端: {}", capability, be.label());
+                Some((parking_lot::Mutex::new(s), be))
+            }
+            Err(e) => {
+                log::warn!("{} 模型加载失败，跳过对应能力: {}", capability, e);
+                None
+            }
+        }
+    }
 
+    /// 初始化引擎：按 CUDA → DirectML → CPU 三级回退加载全部模型。
+    /// 加载顺序：TOPIQ-NR/IAA（主）→ NIMA 技术质量（后备，可选）→ 其余能力模型。
+    pub fn new(model_dir: &std::path::Path) -> anyhow::Result<Self> {
         log::info!("AI 引擎初始化，模型目录: {}", model_dir.display());
         log::info!("DirectML 编译支持: {}", directml_available());
 
@@ -128,83 +150,40 @@ impl AiEngine {
         let mut backend = GpuBackend::Cpu;
 
         // NIMA 技术质量模型（可选）：TOPIQ-NR 不可用时的后备
-        let nima_tech_session = if tech_path.exists() {
-            log::info!("NIMA 技术模型存在: {}", tech_path.display());
-            match Self::build_session(&tech_path, false) {
-                Ok((s, be)) => {
-                    backend = be;
-                    log::info!("NIMA 技术会话就绪，推理后端: {}", be.label());
-                    Some(parking_lot::Mutex::new(s))
-                }
-                Err(e) => {
-                    log::warn!("NIMA 技术模型加载失败，跳过技术评分: {}", e);
-                    None
-                }
-            }
-        } else {
-            log::warn!("NIMA 技术模型不存在，跳过技术评分（使用启发式）");
-            None
-        };
+        let nima_tech_session =
+            if let Some((s, be)) = Self::load_optional_session(&model_dir.join(NIMA_TECH_MODEL), "NIMA 技术") {
+                backend = be;
+                Some(s)
+            } else {
+                None
+            };
 
-        // TOPIQ-NR 技术质量模型（主用，ResNet50）：优先 DirectML，失败回退 CPU
-        let topiq_nr_path = model_dir.join(TOPIQ_NR_MODEL);
-        let topiq_nr_session = if topiq_nr_path.exists() {
-            log::info!("TOPIQ-NR 模型存在: {}", topiq_nr_path.display());
-            match Self::build_session(&topiq_nr_path, false) {
-                Ok((s, be)) => {
-                    backend = be;
-                    log::info!("TOPIQ-NR 会话就绪，推理后端: {}", be.label());
-                    Some(parking_lot::Mutex::new(s))
-                }
-                Err(e) => {
-                    log::warn!("TOPIQ-NR 模型加载失败，回退 NIMA: {}", e);
-                    None
-                }
-            }
-        } else {
-            log::warn!("TOPIQ-NR 模型不存在，使用 NIMA 技术评分");
-            None
-        };
+        // TOPIQ-NR 技术质量模型（主用，ResNet50）：不可用时技术分回退 NIMA
+        let topiq_nr_session =
+            if let Some((s, be)) = Self::load_optional_session(&model_dir.join(TOPIQ_NR_MODEL), "TOPIQ-NR") {
+                backend = be;
+                Some(s)
+            } else {
+                None
+            };
 
-        // TOPIQ-IAA 美学模型（主用，ResNet50）：优先 DirectML，失败回退 CPU
-        let topiq_iia_path = model_dir.join(TOPIQ_IAA_MODEL);
-        let topiq_iia_session = if topiq_iia_path.exists() {
-            log::info!("TOPIQ-IAA 模型存在: {}", topiq_iia_path.display());
-            match Self::build_session(&topiq_iia_path, false) {
-                Ok((s, be)) => {
-                    backend = be;
-                    log::info!("TOPIQ-IAA 会话就绪，推理后端: {}", be.label());
-                    Some(parking_lot::Mutex::new(s))
-                }
-                Err(e) => {
-                    log::warn!("TOPIQ-IAA 模型加载失败，无美学后备: {}", e);
-                    None
-                }
-            }
-        } else {
-            log::warn!("TOPIQ-IAA 模型不存在，无美学评分");
-            None
-        };
+        // TOPIQ-IAA 美学模型（主用，ResNet50）：不可用时无美学后备
+        let topiq_iia_session =
+            if let Some((s, be)) = Self::load_optional_session(&model_dir.join(TOPIQ_IAA_MODEL), "TOPIQ-IAA") {
+                backend = be;
+                Some(s)
+            } else {
+                None
+            };
 
         // HyperIQA（可选）：非人像美学融合的第二意见
-        let hyperiqa_path = model_dir.join(HYPERIQA_MODEL);
-        let hyperiqa_session = if hyperiqa_path.exists() {
-            log::info!("HyperIQA 模型存在: {}", hyperiqa_path.display());
-            match Self::build_session(&hyperiqa_path, false) {
-                Ok((s, be)) => {
-                    backend = be;
-                    log::info!("HyperIQA 会话就绪，推理后端: {}", be.label());
-                    Some(parking_lot::Mutex::new(s))
-                }
-                Err(e) => {
-                    log::warn!("HyperIQA 加载失败，跳过非人像美学融合: {}", e);
-                    None
-                }
-            }
-        } else {
-            log::info!("HyperIQA 模型不存在，跳过非人像美学融合");
-            None
-        };
+        let hyperiqa_session =
+            if let Some((s, be)) = Self::load_optional_session(&model_dir.join(HYPERIQA_MODEL), "HyperIQA") {
+                backend = be;
+                Some(s)
+            } else {
+                None
+            };
 
         // InsightFace buffalo_l 人脸检测（可选）：存在 models/insightface/ 时加载
         let insightface_dir = model_dir.join("insightface");
@@ -226,24 +205,12 @@ impl AiEngine {
             None
         };
 
-        // TOPIQ-NR-Face 人脸专评（可选）：模型存在时加载
-        let face_path = model_dir.join(crate::ai::topiq_face::MODEL_NAME);
-        let face_session = if face_path.exists() {
-            log::info!("TOPIQ-NR-Face 模型存在: {}", face_path.display());
-            match Self::build_session(&face_path, false) {
-                Ok((s, be)) => {
-                    log::info!("TOPIQ-NR-Face 会话就绪，推理后端: {}", be.label());
-                    Some(parking_lot::Mutex::new(s))
-                }
-                Err(e) => {
-                    log::warn!("TOPIQ-NR-Face 模型加载失败，跳过人脸专评: {}", e);
-                    None
-                }
-            }
-        } else {
-            log::warn!("TOPIQ-NR-Face 模型不存在，跳过人脸专评");
-            None
-        };
+        // TOPIQ-NR-Face 人脸专评（可选）：模型存在时加载（不改变引擎后端标签）
+        let face_session = Self::load_optional_session(
+            &model_dir.join(crate::ai::topiq_face::MODEL_NAME),
+            "TOPIQ-NR-Face",
+        )
+        .map(|(s, _)| s);
 
         // MobileNetV3 场景分类（可选）：模型存在时加载（在 models/scene/ 子目录）
         let scene_dir = model_dir.join("scene");
@@ -413,7 +380,7 @@ impl AiEngine {
         self.backend
     }
 
-    /// 是否启用了 GPU 加速（DirectML）。
+    /// 是否启用了 GPU 加速（CUDA 或 DirectML）。
     pub fn gpu_enabled(&self) -> bool {
         self.backend.is_gpu()
     }
@@ -582,11 +549,7 @@ impl AiEngine {
             return *hit;
         }
         let faces = det.detect(rgb, h, w).ok()?;
-        let face = faces.into_iter().max_by(|a, b| {
-            let area_a = (a.bbox[2] - a.bbox[0]) * (a.bbox[3] - a.bbox[1]);
-            let area_b = (b.bbox[2] - b.bbox[0]) * (b.bbox[3] - b.bbox[1]);
-            area_a.partial_cmp(&area_b).unwrap_or(std::cmp::Ordering::Equal)
-        });
+        let face = crate::ai::insightface::Face::largest(faces);
         self.detect_cache.lock().insert(path.to_string(), face);
         face
     }
@@ -607,15 +570,7 @@ impl AiEngine {
         let img = crate::cache::proxy::ai_proxy(path).ok()?;
         let (w, h) = (img.width(), img.height());
         let raw = img.as_raw();
-        let faces = face_engine.detect(raw, h, w).ok()?;
-        let max_face = faces
-            .iter()
-            .max_by(|a, b| {
-                let area_a = (a.bbox[2] - a.bbox[0]) * (a.bbox[3] - a.bbox[1]);
-                let area_b = (b.bbox[2] - b.bbox[0]) * (b.bbox[3] - b.bbox[1]);
-                area_a.partial_cmp(&area_b).unwrap_or(std::cmp::Ordering::Equal)
-            })
-            .copied()?;
+        let max_face = crate::ai::insightface::Face::largest(face_engine.detect(raw, h, w).ok()?)?;
         Some((
             max_face.bbox,
             vec![
@@ -636,15 +591,7 @@ impl AiEngine {
         let img = crate::cache::proxy::ai_proxy(path).ok()?;
         let (w, h) = (img.width(), img.height());
         let raw = img.as_raw();
-        let faces = face_engine.detect(raw, h, w).ok()?;
-        let max_face = faces
-            .iter()
-            .max_by(|a, b| {
-                let area_a = (a.bbox[2] - a.bbox[0]) * (a.bbox[3] - a.bbox[1]);
-                let area_b = (b.bbox[2] - b.bbox[0]) * (b.bbox[3] - b.bbox[1]);
-                area_a.partial_cmp(&area_b).unwrap_or(std::cmp::Ordering::Equal)
-            })
-            .copied()?;
+        let max_face = crate::ai::insightface::Face::largest(face_engine.detect(raw, h, w).ok()?)?;
         eye_det.detect_probs(face_engine, raw, h, w, &max_face)
     }
 
@@ -730,11 +677,7 @@ impl AiEngine {
             for ((idx, path, rgb, w, h), res) in ready.into_iter().zip(results) {
                 match res {
                     Ok(faces) => {
-                        let max = faces.into_iter().max_by(|a, b| {
-                            let aa = (a.bbox[2] - a.bbox[0]) * (a.bbox[3] - a.bbox[1]);
-                            let bb = (b.bbox[2] - b.bbox[0]) * (b.bbox[3] - b.bbox[1]);
-                            aa.partial_cmp(&bb).unwrap_or(std::cmp::Ordering::Equal)
-                        });
+                        let max = crate::ai::insightface::Face::largest(faces);
                         self.detect_cache.lock().insert(path, max);
                         if let Some(face) = max {
                             has_face[idx] = true;
@@ -764,14 +707,10 @@ impl AiEngine {
 
         // 2) TOPIQ-NR-Face 批量推理（人脸 crop 已是 512×512）
         let mut sess_guard = face_sess.lock();
-        let refs: Vec<(&[u8], u32)> = crops
-            .iter()
-            .map(|(_, rgb, side)| (rgb.as_slice(), *side))
-            .collect();
         // 转成 topiq_face 接口需要的 (Vec<u8>, u32)
-        let crop_owned: Vec<(Vec<u8>, u32)> = refs
+        let crop_owned: Vec<(Vec<u8>, u32)> = crops
             .iter()
-            .map(|(rgb, side)| (rgb.to_vec(), *side))
+            .map(|(_, rgb, side)| (rgb.clone(), *side))
             .collect();
         match crate::ai::topiq_face::face_quality_scores(&mut sess_guard, &crop_owned) {
             Ok(vals) => {
@@ -920,9 +859,8 @@ impl AiEngine {
     /// `face`: TOPIQ-NR-Face 人脸专评分数组（可选，1~10）
     /// `has_face`: 是否检测到人脸
     /// `eye_open`: 每张图 `max(open_l, open_r) ∈ [0,1]`（1=至少一眼开；0=双眼全闭）。
-    ///   **阶段二起**由布尔闭眼标记改为连续开眼概率；**阶段三**将聚合由 `min` 改为
-    ///   `max`（仅当双眼都判闭才降权），避免单眼 ROI 采到皮肤/眼镜致 0.00 就压垮
-    ///   整张睁眼花。无人脸/未启用 → 1.0。
+    ///   连续开眼概率（由早期布尔闭眼标记演化而来），聚合用 `max`——仅当双眼都判闭
+    ///   才降权，避免单眼 ROI 采到皮肤/眼镜致 0.00 压垮整张睁眼照。无人脸/未启用 → 1.0。
     /// `widths/heights/sizes`: 启发式信息
     pub fn composite_scores(
         &self,
@@ -993,18 +931,10 @@ impl PipelineTiming {
 }
 
 /// 双缓冲流水线中一批图片的预处理 tensor（channel 传输单元）。
+#[derive(Default)]
 struct BatchTensors {
     topiq: Option<Array4<f32>>,
     nima: Option<Array4<f32>>,
-}
-
-impl Default for BatchTensors {
-    fn default() -> Self {
-        Self {
-            topiq: None,
-            nima: None,
-        }
-    }
 }
 
 /// 对 `paths` 做双缓冲批量评分：producer 线程用 rayon 并行构建下一批 tensor
@@ -1117,13 +1047,13 @@ pub fn score_batch_scores(
     (aes, tech, timing)
 }
 
-/// 闭眼连续降权系数（阶段三）。`open = max(open_l, open_r) ∈ [0,1]`。
+/// 闭眼连续降权系数。`open = max(open_l, open_r) ∈ [0,1]`。
 ///
 /// - `open >= 0.5`（至少一眼判开）→ `1.0`，不降权；
 /// - `open < 0.5`（双眼都判闭）→ 平滑降到 `0.5`，全闭取极值 `0.5`。
 ///
-/// 阶段三把聚合从 `min` 改为 `max`：实测戴镜/偏脸时单眼 ROI 常采到皮肤或眼镜，
-/// OCEC 给 0.00 → 旧 `min` 会把整张明显的睁眼花压成 ×0.5，失去区分度。
+/// 聚合采用 `max` 而非 `min`：实测戴镜/偏脸时单眼 ROI 常采到皮肤或眼镜，
+/// OCEC 给 0.00 → 旧 `min` 会把整张明显的睁眼照压成 ×0.5，失去区分度。
 /// 改用 `max` 后只有双眼都判闭才降权，单眼噪声不再压垮整脸。
 /// 注：spec 字面 `0.5 + 0.5*open` 会对明显睁眼但 `open<1` 也降权，属回归，故采用分段。
 fn eye_penalty(open: f32) -> f32 {

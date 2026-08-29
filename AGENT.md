@@ -46,13 +46,15 @@ cd "$ROOT/src-tauri" && cargo build --release
 
 ## 真图验证（examples）
 
-验证 Rust 侧 AI 链路，传真实照片目录（**只读**），必须给 Windows 风格路径：
+验证 Rust 侧 AI 链路，传真实照片目录（**只读**），必须给 Windows 风格路径。
+**完整脚本清单见 `src-tauri/examples/README.md`**（回归/诊断/一次性探针三类），常用：
 
 ```bash
 cargo run --example verify_ai -- <照片目录> 8   # 全链路评分
 cargo run --example verify_face -- <目录>                    # 人脸检测
 cargo run --example verify_eye -- <目录>                     # 闭眼检测
 cargo run --example verify_scene -- <目录>                   # 场景分类
+cargo run --example verify_labeled -- <标注集目录>           # 闭眼标注集回归基准
 ```
 
 照片目录等本机私人路径见 `PRIVATE.local.md`（不入库）。
@@ -125,7 +127,7 @@ cargo run --example verify_scene -- <目录>                   # 场景分类
 
 ### 易变签名
 
-`composite_scores`（engine.rs）与 `build_groups`（quality/recommender.rs）签名改动频繁（前者已从纯 slice 演化为 Option 混合）。改前先查定义与全部调用点（`commands.rs`、`examples/verify_*.rs`、测试），改后逐一同步。
+AI 评分阶段的全量逐图结果统一走 `quality/recommender.rs::AiScoreBundle`（综合/美学/技术/人脸/has_face/场景/闭眼/对焦 8 个等长数组；`empty(len)` 生成中性占位）——`score_groups_with_ai` 与 `build_groups` 都以它为参数，新增评分维度在此扩字段，不再加位置参数。`composite_scores`（engine.rs）签名也较复杂（Option 混合切片），改前先查定义与全部调用点（`commands.rs`、`examples/verify_*.rs`、测试），改后逐一同步。
 
 ## 模型与打包
 
@@ -163,11 +165,11 @@ cargo run --example verify_scene -- <目录>                   # 场景分类
 
 ### InsightFace 5 关键点眼位系统性偏低（~10% 脸高）
 
-det_10g 的「眼睛」关键点实测落在真实眼睛下方约 0.1×脸高（bbox 相对高度 0.45~0.50，应为 ~0.35），直接以其为中心的小窗口采样会采到脸颊。**眼 ROI 一律改用脸网格虹膜中心**（`EyeDetector::mesh_result` 返回 `*_eye_src`，经逆仿射映射回原图）；关键点只用于角度/bbox。诊断手法：`dump_eye_roi` 导出 ROI PNG 目视。
+det_10g 的「眼睛」关键点实测落在真实眼睛下方约 0.1×脸高（bbox 相对高度 0.45~0.50，应为 ~0.35），直接以其为中心的小窗口采样会采到脸颊。**眼 ROI 一律改用脸网格虹膜中心**（`EyeDetector::mesh_result` 返回 `*_eye_src`，经逆仿射映射回原图）；关键点只用于角度/bbox。诊断手法：`verify_bbox` 导出人脸框/眼 ROI PNG 目视。
 
 ### 闭眼检测：OCEC 只认眨眼式，垂目靠脸网格
 
-OCEC（训练数据=眨眼式闭眼）对「垂目/低头看」判全开（任务不匹配，调参无解），且对刘海遮挡的睁眼常有假闭误报。现行融合（`engine.rs::eye_open_probs`）：**脸网格垂目开度为主信号**（睑缝高/虹膜直径，尺度无关），OCEC 仅在「网格 <0.85 且双眼 min(prob_open) <0.2」时眨眼否决；网格缺失回退 OCEC 原 max 语义。锚点/门限常量（`MESH_RAW_*`/`OCEC_VETO_MAX`/`MESH_VETO_BAND`）如需调整，回归基准是 `verify_labeled`（标注集 6/7，组4 极端侧脸为已知不可解）。
+OCEC（训练数据=眨眼式闭眼）对「垂目/低头看」判全开（任务不匹配，调参无解），且对刘海遮挡的睁眼常有假闭误报。现行融合（`engine.rs::eye_open_probs`）：**脸网格垂目开度为主信号**（睑缝高/虹膜直径，尺度无关），OCEC 仅在「网格 <0.85 且双眼 min(prob_open) <0.2」时眨眼否决；网格缺失回退 OCEC 原 max 语义。锚点/门限常量（`MESH_RAW_*`/`OCEC_VETO_MAX`/`MESH_VETO_BAND`）如需调整，回归基准是 `verify_labeled`（标注集 7/7 全通过；历史基线 6/7，组4 极端侧脸由统一代理 + 检测修复解决）。
 
 ### fix batch=1 模型批量推理的报错特征
 
@@ -212,4 +214,4 @@ OCEC（训练数据=眨眼式闭眼）对「垂目/低头看」判全开（任�
 
 ---
 
-*最后更新：2026-08-27*
+*最后更新：2026-08-29*

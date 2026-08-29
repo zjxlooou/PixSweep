@@ -1,5 +1,5 @@
 //! 验证 RAW 全显影预览路径（get_full_image 的 RAW 分支核心）：
-//! 传感器原生分辨率 + EXIF 转正 + 耗时。用完即删。
+//! 传感器原生分辨率 + EXIF 转正 + 耗时。
 use std::time::Instant;
 
 fn main() -> anyhow::Result<()> {

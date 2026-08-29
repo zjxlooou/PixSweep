@@ -42,6 +42,17 @@ pub struct Face {
     pub landmarks: Landmark5,
 }
 
+impl Face {
+    /// 取 bbox 面积最大的人脸（多人照片聚焦主体）。
+    pub fn largest(faces: impl IntoIterator<Item = Face>) -> Option<Face> {
+        faces.into_iter().max_by(|a, b| {
+            let area_a = (a.bbox[2] - a.bbox[0]) * (a.bbox[3] - a.bbox[1]);
+            let area_b = (b.bbox[2] - b.bbox[0]) * (b.bbox[3] - b.bbox[1]);
+            area_a.partial_cmp(&area_b).unwrap_or(std::cmp::Ordering::Equal)
+        })
+    }
+}
+
 /// 相似仿射参数（平移 + 缩放 + 旋转，InsightFace align_5p 风格）。
 #[derive(Debug, Clone, Copy)]
 struct Affine {
@@ -68,10 +79,6 @@ pub struct InsightFaceEngine {
 
 /// SCRFD 输入边长（letterbox 目标）。
 const DET_SIZE: u32 = 640;
-
-/// 会话副本数按显存/内存动态确定（`ai::hardware::det_replicas`）；
-/// 6GB 卡实测 2 副本最优，4 副本会挤压显存使后续模型变慢（2026-08-29 实测）。
-
 
 impl Default for InsightFaceEngine {
     fn default() -> Self {
@@ -106,7 +113,7 @@ impl InsightFaceEngine {
             anyhow::bail!("未找到 det_10g.onnx: {}", det_path.display());
         }
 
-        // 优先批量会话（det_10_batched，一次前向跑 B 张，GPU 利用率最高）
+        // 优先批量会话（det_10g_batched，一次前向跑 B 张，GPU 利用率最高）
         let batched_path = models_dir.join("det_10g_batched.onnx");
         if batched_path.exists() {
             match Self::build_session(&batched_path, force_cpu) {
@@ -151,17 +158,10 @@ impl InsightFaceEngine {
             return Ok(s);
         }
         log::warn!("[InsightFace] DirectML 失败: {}", path.display());
-        // CPU 保底
-        let mut builder = Session::builder()
-            .map_err(|e| anyhow::anyhow!("创建 session builder 失败: {e}"))?
-            .with_optimization_level(GraphOptimizationLevel::Level3)
-            .map_err(|e| anyhow::anyhow!("设置图优化失败: {e}"))?
-            .with_parallel_execution(false)
-            .map_err(|e| anyhow::anyhow!("设置并行执行失败: {e}"))?
-            .with_memory_pattern(false)
-            .map_err(|e| anyhow::anyhow!("设置内存模式失败: {e}"))?
-            .with_intra_threads(1)
-            .map_err(|e| anyhow::anyhow!("设置线程数失败: {e}"))?;
+        // CPU 保底（与 GPU 分支同一套会话选项）
+        let mut builder = Self::configure(Session::builder()
+            .map_err(|e| anyhow::anyhow!("创建 session builder 失败: {e}"))?)
+            .map_err(|e| anyhow::anyhow!("配置 builder: {e}"))?;
         Ok(builder.commit_from_file(path)
             .map_err(|e| anyhow::anyhow!("commit_from_file 失败: {e}"))?)
     }
@@ -199,8 +199,7 @@ impl InsightFaceEngine {
     }
 
     /// 检测图像中所有的人脸（det_10g）。
-    /// `image` 是 HWC 格式的 RGB u8 数据（h × w × 3）。
-    /// 检测图像中所有的人脸。批量会话可用时走 batch=1 快路径，否则走副本池。
+    /// 批量会话可用时走 batch=1 快路径，否则走副本池。
     /// `image` 是 HWC 格式的 RGB u8 数据（h × w × 3）。
     pub fn detect(&self, image: &[u8], h: u32, w: u32) -> anyhow::Result<Vec<Face>> {
         if self.batched_session.is_some() {

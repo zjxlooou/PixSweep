@@ -36,7 +36,8 @@ PixSweep 的所有构建、打包、测试、模型导出脚本集中在此目�
 
 ## 真图验证（examples）
 
-验证 Rust 侧 AI 链路，传真实照片目录（只读），见 [`AGENT.md`](../AGENT.md) 的「真图验证」一节：
+验证 Rust 侧 AI 链路，传真实照片目录（只读）。完整清单（回归/诊断/一次性探针三类）
+见 [`src-tauri/examples/README.md`](../src-tauri/examples/README.md)，常用：
 
 ```bash
 cargo run --example verify_ai -- <照片目录> 8   # 全链路评分
@@ -44,7 +45,8 @@ cargo run --example verify_face -- <目录>                    # 人脸检测
 cargo run --example verify_eye -- <目录>                     # 闭眼检测
 cargo run --example verify_scene -- <目录>                   # 场景分类
 cargo run --example verify_focus -- <图片...>                # 对焦校准
+cargo run --example verify_labeled -- <标注集目录>           # 闭眼标注集回归基准
 ```
 
-> `src-tauri/examples/` 下还有 `verify_full`（全维度诊断）、`verify_bbox`（人脸框/眼 ROI 可视化）、
-> `verify_orient`（EXIF 方向）、`verify_landmarks`（人脸关键点）等诊断脚本。
+> 注意：`verify_ai` 恒设 `has_face=false`、`eye_open=1.0`（纯整图链路），测不到人脸/
+> 闭眼/眼部对焦；测这些须走 `verify_labeled`（标注集）或 `verify_full`（全维度诊断）。

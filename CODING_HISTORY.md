@@ -308,6 +308,49 @@ Wikimedia Commons 4 类（人像/狗/风景/食物）× 合成降级（blur/jpeg
 
 **验证**：四品牌探针全对（Panasonic 2.6MP 预览→17.1MP、Sony 1.7MP→22.9MP 竖拍 4000×6000 与 JPG 完全一致、Nikon/Canon 本就一致）；ARW 成对综合分差 0.5~0.9 → 0.11~0.20（残余为预览真实清晰度差异）；RW2 成对综合分差 0.5 → ≤0.01；确定性双跑一致；cargo test 42/42。
 
+### 2026-08-29（晚）— 功能封板整理（命名 / 死代码 / 函数拆分 / 文档同步）
+
+**需求**：功能改动封板，做全面整理——命名优化、删死代码与冗余、拆函数抽公共工具降嵌套、
+文档随代码更新、梳理测试与打包脚本；临时文件留本地不入 git；全量测试通过后汇报。
+
+**完成**：
+- **examples 修复与梳理**：修复 `dump_aligned_crops` / `verify_bbox` 缺 `mut` 的编译错误
+  （`InsightFaceEngine::load` 需要 `&mut self`，此前 `cargo check --all-targets` 在这两个
+  脚本上必失败）；删除已完成使命的一次性脚本 `dump_aligned_crops.rs`（nr_face 重导出
+  评测用，git 历史可找回）；新增 `examples/README.md` 按「功能回归 / 人工诊断 / 一次性
+  探针」三类编目全部脚本；`verify_labeled` / `preview_check` 去掉"用完即删"过时标注
+  （前者是闭眼标注集回归基准，长期保留）。
+- **评分结果束**：`commands.rs` ↔ `build_groups` 之间的 8 元组收敛为
+  `quality/recommender.rs::AiScoreBundle`（`empty(len)` 生成 AI 未启用占位），
+  `build_groups` 签名从 11 参数降到 4，消除易错位置参数（呼应"易变签名"痛点）。
+- **拆分长函数**：`score_groups_with_ai`（约 390 行）拆为缓存装载（`load_score_caches`
+  / `load_face_caches`）、场景线程（`spawn_scene_thread`）、人脸阶段（`run_face_phase`）、
+  闭眼阶段（`run_eye_phase`）、对焦阶段（`run_focus_phase`）、HyperIQA 融合
+  （`fuse_hyperiqa_for_non_portrait`）、场景合并（`merge_scene_results`）；
+  `AiEngine::new` 的 7 段重复装载收敛为 `load_optional_session`。
+- **公共工具抽取**：`Face::largest`（4 处"取最大脸"重复）、`scene_input_tensor` + `argmax`
+  （scene.rs 两份重复预处理/argmax）、`ai::mos_from_bins`（NIMA 与 TOPIQ-IAA 同一
+  10-bin 加权平均公式）、`image_io::apply_exif` + `develop_raw_oriented`（RAW 显影+转正
+  两份重复）、`chunk_paths`（扫描阶段 5 处取路径重复）。
+- **注释纠偏**：清除残留 CLIP/LAION 表述（types / phash / recommender / commands /
+  CODING_HISTORY 评分链）；`get_full_image` 注释 1600 → 实际 3072；内存日志 tag 与
+  实际阶段对齐（原"hash+cluster done"打在评分后）；`det_10_batched` 拼写；
+  `lib.rs` 日志路径与"DirectML 单后端"过时描述；`BatchTensors` 改 derive(Default)。
+- **打包脚本**：`build_release.ps1` 在 zip 校验通过后自动删除解包目录（此前每次打包
+  残留约 1GB 解包副本，dist-package 已积压 15G）。
+- **文档同步**：`docs/DESIGN.md` 整体重写为当前架构（原稿停留在立项期的
+  CLIP 聚类 / SQLite / 单 DirectML 时代）；`docs/TESTING.md`（vitest 命令、测试覆盖描述）、
+  `scripts/README.md`（examples 指引）、`AGENT.md`（`dump_eye_roi` 已删改指 `verify_bbox`、
+  标注集回归结论 7/7、AiScoreBundle 签名约定）同步更新。
+
+**验证**：cargo check --all-targets 零警告（含全部 examples）；cargo test 46/46；
+vitest 25/25；tsc 零错误；e2e PASSED。
+
+**新坑记录**：本机 `cargo test` 默认并行构建存在竞态——example/bin 单元随机报
+`E0462 found staticlib xxx.dll.lib` / `E0786 invalid metadata`（失败点漂移，删
+`target/debug` 重建不能根除）；`cargo test -j 1` 串行全量稳定通过。日常验证用
+`cargo test --lib`（46 个单测全在 lib），需要 example 链接验证时用 `-j 1`。
+
 ---
 
 ## 评分模型演进（重要）
@@ -321,12 +364,12 @@ Wikimedia Commons 4 类（人像/狗/风景/食物）× 合成降级（blur/jpeg
 | 人像优先 | 技术/美学作基础分 + **对焦** + **人脸专评** + **闭眼** | 同左（人像由人脸分主导） | 08-22 |
 
 **当前评分链**（type-first，权重见 `ai/engine.rs`）：
-- 技术：TOPIQ-NR（ResNet50，KonIQ-10k，DirectML）→ CLIP-IQA+（CPU EP）→ NIMA（DirectML）
-- 美学：TOPIQ-IAA（ResNet50，AVA，DirectML）→ CLIP ViT-B/32 + LAION 线性头
+- 技术：TOPIQ-NR（ResNet50，KonIQ-10k）→ NIMA（MobileNet 后备；CLIP-IQA+ 已于 08-27 移除）
+- 美学：TOPIQ-IAA（ResNet50，AVA）；非人像场景 ⊕ HyperIQA 50/50 融合（LAION 线性头已移除，美学无后备）
 - 对焦：灰度拉普拉斯方差（模型无关，`ai/focus.rs`）
-- 人脸专评：TOPIQ-NR-Face（ResNet50，CGFIQA-40k，需 InsightFace 检测）
+- 人脸专评：TOPIQ-NR-Face（ResNet50，CGFIQA-40k，需 InsightFace 检测）⊕ nr-on-face 50/50（08-27）
 - 闭眼：**MediaPipe 脸网格垂目开度为主信号 + OCEC 眨眼否决**（`ai/eye.rs`，只有双眼都闭才降权）
-- 去重核心：**感知哈希（dhash + ahash）双哈希**（CLIP 仅作美学后备，不参与聚类）
+- 去重核心：**感知哈希（dhash + ahash）双哈希**（不依赖任何 AI 模型）
 
 ## 架构演进（重要）
 

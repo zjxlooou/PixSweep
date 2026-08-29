@@ -113,7 +113,7 @@ pub fn is_raw_image<P: AsRef<Path>>(path: P) -> bool {
 /// 相机端已完成去马赛克/白平衡/降噪，毫秒级），全无嵌入预览时回退全显影
 /// （demosaic → sRGB，秒级）。两种路径都按 RAW 内 EXIF orientation 旋转。
 pub fn load_image_oriented<P: AsRef<Path>>(path: P) -> anyhow::Result<DynamicImage> {
-    // 并发限流：见 MAX_CONCURRENT_DECODE。缓存命中类调用（如 ai_proxy 命中缓存）
+    // 并发限流：上限见 max_concurrent_decode()。缓存命中类调用（如 ai_proxy 命中缓存）
     // 不经过本函数，不受限。
     let _guard = DecodeGuard::acquire();
     let path_ref = path.as_ref();
@@ -247,7 +247,6 @@ pub fn header_dimensions<P: AsRef<Path>>(path: P) -> Option<(u32, u32)> {
 pub fn load_raw_developed(path: &Path) -> anyhow::Result<DynamicImage> {
     use rawler::decoders::RawDecodeParams;
     use rawler::get_decoder;
-    use rawler::imgop::develop::RawDevelop;
     use rawler::rawsource::RawSource;
 
     let _guard = DecodeGuard::acquire();
@@ -260,17 +259,7 @@ pub fn load_raw_developed(path: &Path) -> anyhow::Result<DynamicImage> {
         .raw_metadata(&rawfile, &params)
         .ok()
         .and_then(|md| md.exif.orientation);
-    let raw = decoder.raw_image(&rawfile, &params, false)?;
-    let orientation = exif_u16.or_else(|| Some(raw.orientation.to_u16()));
-    let img = RawDevelop::default()
-        .develop_intermediate(&raw)?
-        .to_dynamic_image()
-        .ok_or_else(|| anyhow::anyhow!("RAW 显影输出为空: {}", path.display()))?;
-    let mut img = img;
-    if let Some(o) = orientation.and_then(|v| u8::try_from(v).ok()).and_then(image::metadata::Orientation::from_exif) {
-        img.apply_orientation(o);
-    }
-    Ok(img)
+    develop_raw_oriented(decoder.as_ref(), &rawfile, &params, exif_u16, path)
 }
 
 /// RAW 解码：机内嵌预览优先（毫秒级），全无嵌入预览时回退全显影（秒级）。
@@ -279,9 +268,8 @@ pub fn load_raw_developed(path: &Path) -> anyhow::Result<DynamicImage> {
 /// （预览走 `raw_metadata.exif.orientation`，显影走 `raw.orientation`）。
 fn load_raw_oriented(path: &Path) -> anyhow::Result<DynamicImage> {
     use rawler::decoders::RawDecodeParams;
-    use rawler::imgop::develop::RawDevelop;
-    use rawler::rawsource::RawSource;
     use rawler::get_decoder;
+    use rawler::rawsource::RawSource;
 
     let rawfile = RawSource::new(path)
         .map_err(|e| anyhow::anyhow!("RAW 打开失败 {}: {e}", path.display()))?;
@@ -294,13 +282,6 @@ fn load_raw_oriented(path: &Path) -> anyhow::Result<DynamicImage> {
         .raw_metadata(&rawfile, &params)
         .ok()
         .and_then(|md| md.exif.orientation);
-    let apply = |img: DynamicImage| -> DynamicImage {
-        let mut img = img;
-        if let Some(o) = exif_u16.and_then(|v| u8::try_from(v).ok()).and_then(image::metadata::Orientation::from_exif) {
-            img.apply_orientation(o);
-        }
-        img
-    };
 
     // 快路径：机内嵌预览（full > preview > thumbnail，取到即用）
     for attempt in [
@@ -309,22 +290,46 @@ fn load_raw_oriented(path: &Path) -> anyhow::Result<DynamicImage> {
         decoder.thumbnail_image(&rawfile, &params),
     ] {
         if let Ok(Some(img)) = attempt {
-            return Ok(apply(img));
+            return Ok(apply_exif(img, exif_u16));
         }
     }
 
     // 慢路径：全显影（demosaic → 白平衡 → 色彩转换 → sRGB）
     log::info!("[RAW] 无机内嵌预览，走全显影: {}", path.display());
-    let raw = decoder.raw_image(&rawfile, &params, false)?;
+    develop_raw_oriented(decoder.as_ref(), &rawfile, &params, exif_u16, path)
+}
+
+/// 按 EXIF orientation 值旋转图片（值非法/无旋转时原样返回）。
+fn apply_exif(img: DynamicImage, exif_u16: Option<u16>) -> DynamicImage {
+    let mut img = img;
+    if let Some(o) = exif_u16
+        .and_then(|v| u8::try_from(v).ok())
+        .and_then(image::metadata::Orientation::from_exif)
+    {
+        img.apply_orientation(o);
+    }
+    img
+}
+
+/// RAW 全显影并按 EXIF orientation 转正（预览全显影与"无嵌入预览回退"共用）。
+///
+/// 方向取值顺序：外部传入的 EXIF orientation 优先，缺失时回退解码器报告的
+/// `raw.orientation`。
+fn develop_raw_oriented(
+    decoder: &dyn rawler::decoders::Decoder,
+    rawfile: &rawler::rawsource::RawSource,
+    params: &rawler::decoders::RawDecodeParams,
+    exif_u16: Option<u16>,
+    path: &Path,
+) -> anyhow::Result<DynamicImage> {
+    use rawler::imgop::develop::RawDevelop;
+
+    let raw = decoder.raw_image(rawfile, params, false)?;
     let orientation = exif_u16.or_else(|| Some(raw.orientation.to_u16()));
     let img = RawDevelop::default()
         .develop_intermediate(&raw)?
         .to_dynamic_image()
         .ok_or_else(|| anyhow::anyhow!("RAW 显影输出为空: {}", path.display()))?;
-    let mut img = img;
-    if let Some(o) = orientation.and_then(|v| u8::try_from(v).ok()).and_then(image::metadata::Orientation::from_exif) {
-        img.apply_orientation(o);
-    }
-    Ok(img)
+    Ok(apply_exif(img, orientation))
 }
 

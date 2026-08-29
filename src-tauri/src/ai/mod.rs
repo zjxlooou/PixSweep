@@ -19,3 +19,18 @@ pub mod preprocess;
 pub mod scene;
 pub mod topiq;
 pub mod topiq_face;
+
+/// 10-bin MOS 分布 → 1~10 加权平均分（NIMA 与 TOPIQ-IAA 共用的后处理公式）。
+///
+/// 评分 = Σ(bin_i × (i+1)) / Σ(bin_i)；分布全零时返回中位分 5.0。
+pub(crate) fn mos_from_bins(dist: &[f32]) -> f32 {
+    let sum: f32 = dist.iter().sum();
+    if sum <= 0.0 {
+        return 5.0;
+    }
+    dist.iter()
+        .enumerate()
+        .map(|(i, &p)| p * (i as f32 + 1.0))
+        .sum::<f32>()
+        / sum
+}
