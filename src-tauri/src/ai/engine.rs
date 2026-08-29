@@ -369,7 +369,12 @@ impl AiEngine {
             return None;
         }
         let builder = Self::configure_session_builder(Session::builder().ok()?)?;
-        let ep = CUDA::default().with_device_id(0).build();
+        // SameAsRequested：默认 kNextPowerOfTwo 会把 arena 翻倍预留，大激活会话
+        // 挤占显存导致后续小模型分配变慢（HyperIQA 减速 6× 的疑似根因）
+        let ep = CUDA::default()
+            .with_device_id(0)
+            .with_arena_extend_strategy(ort::ep::ArenaExtendStrategy::SameAsRequested)
+            .build();
         let mut builder = builder.with_execution_providers([ep]).ok()?;
         match builder.commit_from_file(path) {
             Ok(s) => Some(s),

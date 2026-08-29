@@ -64,6 +64,21 @@
 - 实测（350 张热缓存）：AI 链 65→52s；全程 69→52s（-25%，含 M1）。
 - 后续可重叠的组合（收益递减）：hyperiqa ∥ eye/focus（~2s）。
 
+### M2.5 — nr_face 动态 batch 重导出（✅ 已完成 2026-08-29）
+
+- `export_face_dynamic.py`（0.8.0 管线同款）：pyiqa `topiq_nr` + CGFIQA-40k 权重
+  （`topiq_nr_cgfiqa_res50-0a8b8e4f.pth`，HF），static_forward th=tw=16（512 输入末级
+  16×16，256 token 与旧模型一致；12 会导致非整因子 adaptive pool 无法导出），
+  torch.onnx.export dynamic batch（dynamo=False）。
+- 导出即语义正确：与 pyiqa eager 推理 spearman=1.00000、maxdiff=0。
+- **FP16**（keep_io_types）：与 fp32 spearman=1.0、maxdiff=0.0011 MOS；84.6MB（fp32 168.6MB）。
+- Rust `face_quality_scores` 批量 8 张一次前向，旧 fix batch=1 模型自动逐张回退。
+- 旧模型（语义不同的静态 batch 版）归档 `models-archive/topiq_nr_face-static-20260829/`。
+- **重要发现：GPU 显存只有 6GB**。大激活会话（fp32 批量 nr_face / det 批量 / 4 副本）
+  会把 VRAM 顶到 91%+，后续小模型（HyperIQA）分配落入 WDDM 共享内存 → 减速 6×。
+  fp16 后缓解。**显存预算是本机一等约束**——新增/扩大会话前必须查 nvidia-smi。
+- 实测：HyperIQA 12.7s→2.2s（VRAM 修复）；AI 链 53.7→40.0s。
+
 ### M3 — CUDA Graphs（固定形状场景消除 launch overhead，预计再 -10~20%）
 
 - 适用：形状完全固定的推理（SCRFD 批 16、scene 批 64、hyperiqa 单张）。

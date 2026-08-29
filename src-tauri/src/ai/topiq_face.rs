@@ -55,14 +55,17 @@ fn preprocess_face_crop(crop_rgb: &[u8], side: u32) -> Array4<f32> {
     arr
 }
 
-/// 对多张人脸 crop 逐张推理（模型 fix batch=1，批量输入会导致
-/// "Got invalid dimensions for input: face_crop" 静默失败）。
+/// 对多张人脸 crop 推理。
 ///
 /// `face_crops`：长度 N 的 `Vec`，每项是 `(crop_rgb, side)`：
 /// - `crop_rgb`：已对齐到正方形的 RGB u8 数据（side × side × 3）
 /// - `side`：正方形边长（任意尺寸，内部 resize 到 512）
 ///
 /// 返回：长度 N 的 `Vec<f32>`，每项 ∈ [0, 1]（CGFIQA MOS）。
+///
+/// 模型有两种形态：
+/// - **动态 batch 导出**（2026-08-29，pyiqa 语义重导出）：8 张一次前向；
+/// - 旧 fix batch=1：批量输入报错，自动回退逐张。
 pub fn face_quality_scores(
     session: &mut Session,
     face_crops: &[(Vec<u8>, u32)],
@@ -70,29 +73,62 @@ pub fn face_quality_scores(
     if face_crops.is_empty() {
         return Ok(Vec::new());
     }
-
-    // 模型 fix batch=1，必须逐张推理（批量拼成 [N,...] 会因 batch>1 静默失败）
+    const BATCH: usize = 8;
     let mut scores = Vec::with_capacity(face_crops.len());
-    for (rgb, side) in face_crops {
-        let single = preprocess_face_crop(rgb, *side);
-        let tensor = ort::value::Tensor::from_array(single)
-            .context("构造 TOPIQ-NR-Face 输入张量失败")?;
-        let outputs = session
-            .run(inputs![INPUT_NAME => tensor])
-            .context("TOPIQ-NR-Face 推理失败")?;
-        let arr = outputs[OUTPUT_NAME]
-            .try_extract_array::<f32>()
-            .context("解析 TOPIQ-NR-Face 输出失败")?;
-        // 输出 [1, 1]
-        let val = arr
-            .as_slice()
-            .context("TOPIQ-NR-Face 输出非连续")?
-            .first()
-            .copied()
-            .ok_or_else(|| anyhow::anyhow!("TOPIQ-NR-Face 输出为空"))?;
-        scores.push(val);
+    for chunk in face_crops.chunks(BATCH) {
+        match face_quality_scores_batch(session, chunk) {
+            Ok(vals) => scores.extend(vals),
+            Err(_) => {
+                // 旧 fix batch=1 模型：批量输入失败，回退逐张
+                for (rgb, side) in chunk {
+                    scores.push(face_quality_score_single(session, rgb, *side)?);
+                }
+            }
+        }
     }
     Ok(scores)
+}
+
+/// 批量前向：[N,3,512,512] 一次推理。
+fn face_quality_scores_batch(
+    session: &mut Session,
+    face_crops: &[(Vec<u8>, u32)],
+) -> anyhow::Result<Vec<f32>> {
+    let n = face_crops.len();
+    let mut batch = Array4::<f32>::zeros((n, 3, INPUT_SIZE as usize, INPUT_SIZE as usize));
+    for (i, (rgb, side)) in face_crops.iter().enumerate() {
+        batch.slice_mut(ndarray::s![i, .., .., ..])
+            .assign(&preprocess_face_crop(rgb, *side).slice(ndarray::s![0, .., .., ..]));
+    }
+    let tensor = ort::value::Tensor::from_array(batch)
+        .context("构造 TOPIQ-NR-Face 批量输入张量失败")?;
+    let outputs = session
+        .run(inputs![INPUT_NAME => tensor])
+        .context("TOPIQ-NR-Face 批量推理失败")?;
+    let arr = outputs[OUTPUT_NAME]
+        .try_extract_array::<f32>()
+        .context("解析 TOPIQ-NR-Face 输出失败")?;
+    let flat = arr.as_slice().context("TOPIQ-NR-Face 输出非连续")?;
+    anyhow::ensure!(flat.len() >= n, "TOPIQ-NR-Face 输出数量不足");
+    Ok(flat[..n].to_vec())
+}
+
+/// 单张前向（旧 fix batch=1 模型的回退路径）。
+fn face_quality_score_single(session: &mut Session, rgb: &[u8], side: u32) -> anyhow::Result<f32> {
+    let single = preprocess_face_crop(rgb, side);
+    let tensor =
+        ort::value::Tensor::from_array(single).context("构造 TOPIQ-NR-Face 输入张量失败")?;
+    let outputs = session
+        .run(inputs![INPUT_NAME => tensor])
+        .context("TOPIQ-NR-Face 推理失败")?;
+    let arr = outputs[OUTPUT_NAME]
+        .try_extract_array::<f32>()
+        .context("解析 TOPIQ-NR-Face 输出失败")?;
+    arr.as_slice()
+        .context("TOPIQ-NR-Face 输出非连续")?
+        .first()
+        .copied()
+        .ok_or_else(|| anyhow::anyhow!("TOPIQ-NR-Face 输出为空"))
 }
 
 /// 将 [0, 1] MOS 映射到 [1, 10]（与 TOPIQ-NR 统一）。

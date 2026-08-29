@@ -179,7 +179,10 @@ impl InsightFaceEngine {
         let mut builder = Self::configure(Session::builder()
             .map_err(|e| anyhow::anyhow!("创建 session builder: {e}"))?)
             .map_err(|e| anyhow::anyhow!("配置 builder: {e}"))?
-            .with_execution_providers([CUDA::default().with_device_id(0).build()])
+            .with_execution_providers([CUDA::default()
+                .with_device_id(0)
+                .with_arena_extend_strategy(ort::ep::ArenaExtendStrategy::SameAsRequested)
+                .build()])
             .map_err(|e| anyhow::anyhow!("注入 CUDA EP: {e}"))?;
         builder.commit_from_file(path)
             .map_err(|e| anyhow::anyhow!("commit_from_file: {e}"))
