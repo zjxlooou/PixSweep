@@ -51,6 +51,19 @@
   消除每批的 H2D/D2H 往返。小模型拷贝开销占比高，收益明显。
 - 风险：绑定错设备反而变慢（GitHub #10000 的教训）——每模型单独基准。
 
+### M2 — nr_face 逐张推理消除（✅ 调研结论 2026-08-29）
+
+- **图手术不可行**：topiq_nr_face 的注意力结构把 batch 缠进 head 维（{256,B,256}→GEMM {256,256}），机械改图无法动态 batch。
+- **正解是 torch 重导出**（与 0.8.0 的 TOPIQ-NR/IAA 动态 batch 同路线，官方 cfanet 权重 + dynamic_axes）——列为后续 M2.5。
+- **IO Binding 暂缓**：ort rc.13 支持 IoBinding，但 nr_face 逐张推理的每 run 开销（输出分配+拷贝）占比小，收益远小于 M4 的阶段重叠；避免在 rc API 上过度投入。
+
+### M4 — 阶段流水线化（✅ 已完成 2026-08-29，AI 链 65→52s）
+
+- **scene ∥ face 跨模型并发**：场景分类（MobileNet 会话）与人脸专评（SCRFD+nr_face 会话）计算独立，用 `std::thread::scope` 线程并发，场景结果写独立缓冲、人脸阶段结束后合并（人像覆盖语义不变）。最终场景分布与串行版逐位一致（{Portrait:325/327, Other:21}）。
+- **顺带修了一个真实并发 bug**：场景/人脸并发时同一代理图可能被双生成，`fs::write` 半写状态下另一方 `image::open` 读到坏文件——代理落盘改为**临时文件 + 原子 rename**。
+- 实测（350 张热缓存）：AI 链 65→52s；全程 69→52s（-25%，含 M1）。
+- 后续可重叠的组合（收益递减）：hyperiqa ∥ eye/focus（~2s）。
+
 ### M3 — CUDA Graphs（固定形状场景消除 launch overhead，预计再 -10~20%）
 
 - 适用：形状完全固定的推理（SCRFD 批 16、scene 批 64、hyperiqa 单张）。

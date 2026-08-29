@@ -1001,48 +1001,38 @@ fn score_groups_with_ai(
 
     log_process_mem("hash+cluster done");
 
-    // 场景分类（MobileNetV3）：只对需要重算的图片分类，人像由 has_faces 覆盖。逐块推进度。
-    if engine.scene_scoring_available() && !need_face.is_empty() {
-        const CHUNK: usize = 64;
-        emit(ScanPhase::Quality, 0, need_face.len(), None, "识别内容");
-        let mut done = 0usize;
-        let scene_start = std::time::Instant::now();
-        let mut pet = 0;
-        let mut landscape = 0;
-        for chunk in need_face.chunks(CHUNK) {
-            let cpaths: Vec<String> = chunk.iter().map(|&i| infos[i].path.clone()).collect();
-            let classified = engine.scene_scores(&cpaths);
-            for (k, &idx) in chunk.iter().enumerate() {
-                let sc = classified.get(k).copied().unwrap_or(crate::ai::scene::Scene::Other);
-                // 人像覆盖：检测到人脸 → 强制人像（ImageNet 无 person 类，MobileNetV3 判不出人像）
-                scenes[idx] = if has_faces[idx] {
-                    crate::ai::scene::Scene::Portrait
-                } else {
-                    match sc {
-                        crate::ai::scene::Scene::Pet => {
-                            pet += 1;
-                            sc
-                        }
-                        crate::ai::scene::Scene::Landscape => {
-                            landscape += 1;
-                            sc
-                        }
-                        _ => sc,
-                    }
-                };
-            }
-            done += chunk.len();
-            emit(ScanPhase::Quality, done, need_face.len(), None, "识别内容");
-        }
-        log::info!(
-            "[AI 评分] 场景分类完成, 耗时 {:.1}s (宠物 {} 张, 风景 {} 张)",
-            scene_start.elapsed().as_secs_f64(),
-            pet,
-            landscape
-        );
-    }
+    // 场景分类（MobileNetV3）：只对需要重算的图片分类。
+    // M4 并发：场景与人脸专评用不同 session（可并发 Run），两者计算独立——
+    // 场景结果写入独立缓冲 scene_raw，人脸阶段结束后再合并（人像覆盖）。
 
     log_process_mem("scene done");
+
+    // M4 并发：场景分类线程（与人脸专评同时跑，不同 session 互不阻塞）。
+    // scope 线程借用本函数局部数据，作用域覆盖场景 spawn + 人脸块 + 合并。
+    let scene_start = std::time::Instant::now();
+    std::thread::scope(|scope| {
+    let scene_thread = if engine.scene_scoring_available() && !need_face.is_empty() {
+        let need_face_ref: &[usize] = &need_face;
+        let infos_ref: &[ImageInfo] = infos;
+        let engine_ref: &crate::ai::engine::AiEngine = engine;
+        Some(scope.spawn(move || {
+                let mut raw = vec![crate::ai::scene::Scene::Other; infos_ref.len()];
+                const CHUNK: usize = 64;
+                for chunk in need_face_ref.chunks(CHUNK) {
+                    let cpaths: Vec<String> =
+                        chunk.iter().map(|&i| infos_ref[i].path.clone()).collect();
+                    let classified = engine_ref.scene_scores(&cpaths);
+                    for (k, &idx) in chunk.iter().enumerate() {
+                        if let Some(sc) = classified.get(k).copied() {
+                            raw[idx] = sc;
+                        }
+                    }
+                }
+                (raw, 0, 0)
+        }))
+    } else {
+        None
+    };
 
     // 人脸专评：仅对需要重算的图片（增量模式未命中人脸缓存者）做检测 + TOPIQ-NR-Face。
     // 逐块检测并推送进度，避免子阶段内进度条不动。
@@ -1075,6 +1065,39 @@ fn score_groups_with_ai(
     }
 
     log_process_mem("face done");
+
+    // M4：等待并发场景分类完成并合并（人像覆盖：has_faces 已由人脸阶段写入）
+    if let Some(handle) = scene_thread {
+        let (raw, mut pet, mut landscape) = match handle.join() {
+            Ok(v) => v,
+            Err(e) => {
+                log::warn!("[AI 评分] 场景分类线程失败: {e:?}");
+                (Vec::new(), 0, 0)
+            }
+        };
+        for &idx in &need_face {
+            if !has_faces[idx] {
+                match raw.get(idx).copied().unwrap_or(crate::ai::scene::Scene::Other) {
+                    crate::ai::scene::Scene::Pet => {
+                        pet += 1;
+                        scenes[idx] = crate::ai::scene::Scene::Pet;
+                    }
+                    crate::ai::scene::Scene::Landscape => {
+                        landscape += 1;
+                        scenes[idx] = crate::ai::scene::Scene::Landscape;
+                    }
+                    other => scenes[idx] = other,
+                }
+            }
+        }
+        log::info!(
+            "[AI 评分] 场景分类完成(与人脸并发 {:.1}s), 宠物 {} 张, 风景 {} 张",
+            scene_start.elapsed().as_secs_f64(),
+            pet,
+            landscape
+        );
+    }
+    });
 
     // 闭眼检测（OCEC）：仅对有脸的图做（人像场景才有意义）。返回 max(open_l, open_r)。
     // 只在检测到的人脸图上逐块推进度。

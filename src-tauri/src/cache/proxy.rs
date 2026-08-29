@@ -96,7 +96,14 @@ pub fn ai_proxy(path: &str) -> anyhow::Result<image::RgbImage> {
     }
 
     let (proxy, jpeg) = encode_proxy(&rgb);
-    let _ = std::fs::write(&cache, &jpeg);
+    // 原子落盘：先写临时文件再 rename——M4 场景/人脸并发时同一代理可能被双生成，
+    // 直接 fs::write 会让对方 image::open 读到半写文件而失败（2026-08-29 实测）。
+    let tmp = cache.with_extension(format!("{}.tmp", uuid::Uuid::new_v4()));
+    if std::fs::write(&tmp, &jpeg).is_ok() {
+        if std::fs::rename(&tmp, &cache).is_err() {
+            let _ = std::fs::remove_file(&tmp);
+        }
+    }
     Ok(proxy)
 }
 
