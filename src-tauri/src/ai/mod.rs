@@ -12,6 +12,7 @@
 pub mod engine;
 pub mod eye;
 pub mod focus;
+pub mod hardware;
 pub mod insightface;
 pub mod nima;
 pub mod preprocess;

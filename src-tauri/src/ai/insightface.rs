@@ -69,9 +69,9 @@ pub struct InsightFaceEngine {
 /// SCRFD 输入边长（letterbox 目标）。
 const DET_SIZE: u32 = 640;
 
-/// 会话副本数。与重活池线程数（6）同量级，GPU 流并发 2 路为宜（4 路会挤压
-/// 显存使后续模型变慢，2026-08-29 实测）。
-const DET_SESSION_REPLICAS: usize = 2;
+/// 会话副本数按显存/内存动态确定（`ai::hardware::det_replicas`）；
+/// 6GB 卡实测 2 副本最优，4 副本会挤压显存使后续模型变慢（2026-08-29 实测）。
+
 
 impl Default for InsightFaceEngine {
     fn default() -> Self {
@@ -120,7 +120,7 @@ impl InsightFaceEngine {
         }
 
         // 逐个建副本；某个副本失败不影响已有副本（至少保 1 个）
-        for i in 0..DET_SESSION_REPLICAS {
+        for i in 0..crate::ai::hardware::det_replicas() {
             match Self::build_session(&det_path, force_cpu) {
                 Ok(sess) => self.det_sessions.push(parking_lot::Mutex::new(sess)),
                 Err(e) => {

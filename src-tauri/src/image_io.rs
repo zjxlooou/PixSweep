@@ -26,20 +26,23 @@ use image::{DynamicImage, ImageDecoder, ImageReader};
 ///
 /// 一张 24MP 解码 ≈ 100~200MB、RAW 全显影瞬时可达 GB 级；rayon 无上限并发
 /// （每核一个任务）曾把 350 张的扫描推到 10GB+ 私有内存（2026-08-29 实测）。
-/// 限到 6 路后解码吞吐仍远超 GPU 推理消耗，不影响流水线重叠。
-const MAX_CONCURRENT_DECODE: usize = 6;
+/// 线程数按机器核心数与内存动态确定（`ai::hardware::decode_threads`），
+/// 吞吐仍远超 GPU 推理消耗，不影响流水线重叠。
+fn max_concurrent_decode() -> usize {
+    crate::ai::hardware::decode_threads()
+}
 static DECODE_INFLIGHT: StdMutex<usize> = StdMutex::new(0);
 static DECODE_CV: Condvar = Condvar::new();
 
 /// 重活专用线程池：解码/代理生成/检测预处理等大缓冲并行工作固定在
-/// [`MAX_CONCURRENT_DECODE`] 线程内执行，替代 rayon 默认"每逻辑核一线程"的
+/// `max_concurrent_decode()` 线程内执行，替代 rayon 默认"每逻辑核一线程"的
 /// 全局池——后者 24 路大缓冲并发会把提交内存推到 10GB+（2026-08-29 实测）。
 /// 池内线程数 == 解码许可数，信号量在池内无竞争。
 pub(crate) fn heavy_pool() -> &'static rayon::ThreadPool {
     static POOL: std::sync::OnceLock<rayon::ThreadPool> = std::sync::OnceLock::new();
     POOL.get_or_init(|| {
         rayon::ThreadPoolBuilder::new()
-            .num_threads(MAX_CONCURRENT_DECODE)
+            .num_threads(max_concurrent_decode())
             .thread_name(|i| format!("pixsweep-heavy-{i}"))
             .build()
             .expect("创建重活线程池失败")
@@ -54,7 +57,7 @@ impl DecodeGuard {
         let mut n = DECODE_INFLIGHT
             .lock()
             .unwrap_or_else(|e| e.into_inner());
-        while *n >= MAX_CONCURRENT_DECODE {
+        while *n >= max_concurrent_decode() {
             n = DECODE_CV.wait(n).unwrap_or_else(|e| e.into_inner());
         }
         *n += 1;
