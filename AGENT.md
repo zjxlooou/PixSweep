@@ -115,8 +115,13 @@ cargo run --example verify_scene -- <目录>                   # 场景分类
 - **消费端全统一**：全部 AI 路径（整图评分/场景/人脸检测/闭眼网格+OCEC/眼对焦/nr-on-face crop）都走 `ai_proxy`；**哈希与缩略图除外**（哈希值稳定性、缩略图自有快路径）。
 - **大小对比基准**：代理只参与图像内容分析（指纹/AI/对焦）；一切文件大小比较（综合分启发式、推荐 tie-break、理由文案）用源文件大小 `ImageInfo.size`（walker 阶段 `fs::metadata` 写入）。`ai_proxy` 只返回像素不返回元数据，即结构性保证。
 - **分辨率口径同理**：RAW 的宽高为传感器原生（`raw_source_dimensions` 覆盖），非预览尺寸；代理/解码尺寸只服务内容分析。
+- **重活并发上限**：全部大缓冲并行工作（解码/代理/检测预处理）跑在 `image_io::heavy_pool()` 专用 6 线程池（== 解码信号量数），绝不用 rayon 全局池（每逻辑核一线程会并发解码，直接把工作集推到 10GB+）。mimalloc 全局分配器与 zig 工具链不兼容（v2/v3 均链接失败），已弃用——内存靠并发上限控制。
 - **精度依据**：对焦整图归一 1024、眼 ROI 归一 24×40 再算拉普拉斯方差，SCRFD letterbox 640×640，闭眼网格用几何比例——对输入分辨率不敏感。闭眼标注集回归 **7/7**（统一前基线 6/7）；RAW 与同画面 JPG 技术分差 ≤0.08、美学 ≤0.02。
 - 验证工具：`examples/proxy_check.rs`（触发判定 + 双断言 + 缓存命中计时）。
+
+### 推荐语义：RAW 优先（2026-08-28）
+
+组内同时有 RAW 与其导出 JPG 时保留 RAW（无损母版，JPG 是冗余副本）。RAW 因机内嵌预览偏软综合分系统性略低，故给 0.5 分容差（`RAW_PREFER_TOLERANCE`）：组内最佳 RAW 与全局最佳分差在容差内即改推 RAW；分差过大仍尊重评分。理由文案显式说明 RAW 保留原因。
 
 ### 易变签名
 
@@ -127,7 +132,7 @@ cargo run --example verify_scene -- <目录>                   # 场景分类
 - 模型在 `src-tauri/models/`（**FP16 精度**，~310MB 通用评分模型 + `insightface/` + `scene/` + `eye/` 子目录），**不入 git，不可删**（删除需重新下载），通过发布 zip 分发。文件清单以磁盘为准（`ls src-tauri/models/`）；`models/eye/face_landmarker.onnx`（4.6MB 脸网格）是可选信号，缺失自动退化为仅 OCEC。
 - **外部数据配对文件坑**：部分模型是 `*.onnx` + `*.onnx.data` 成对存放（当前仅 `topiq_nr_face`）。**ORT 校验 .data 引用路径跟随 onnx 文件名**——重命名 onnx 必须同步改内部引用或干脆内嵌为单文件（`onnx.external_data_helper.convert_model_from_external_data`）。打包白名单 `scripts/build_release.ps1` 的 `$neededModels` 必须显式列出全部 `.onnx.data`，否则发布版静默缺件。
 - **精度**：2026-08-27 起三主力模型为 FP16（IO 保持 FP32，引擎零改动）。实测与 FP32 的 ρ≥0.9998、GPU 更快；**CPU EP 无原生 fp16 核会慢数倍，性能结论只在 GPU 上有效**。
-- **美学融合（可选，hyperiqa.onnx 55MB）**：场景≠人像时 美学=TOPIQ-IAA ⊕ HyperIQA 50/50（线性校准 `HYPERIQA_CAL_*`）。人像偏置重故人像不启用。
+- **美学融合（可选，hyperiqa.onnx 55MB）**：场景≠人像时 美学=TOPIQ-IAA ⊕ HyperIQA 50/50（线性校准 `HYPERIQA_CAL_*`）。人像偏置重故人像不启用。**必须逐张推理**（fix batch=1）：批量喂入不仅静默出错，其密集层中间张量随 batch 膨胀——batch=16 单次 run 实测触碰 3.2GB 主机内存（2026-08-29 排查定位，曾致扫描内存峰值 14GB）。
 - **人像融合**：face = nr_face ⊕ nr-on-face 50/50（`FACE_FUSION_NR_FACE_WEIGHT`），修 nr_face 的暗光盲区（欠曝人像不再反向加分）；face 缓存 schema v5、评分缓存 v2 联动失效。
 - **batch 维度**：TOPIQ-NR/IAA 为**动态 batch**（整批一次推理）；其余评分模型仍 **fix batch=1**，必须逐张推理（批量输入静默失败）。
 - `models-archive/` 存弃用模型存档（MUSIQ、CLIP 对、FP32 三巨头），不参与打包、不入库。

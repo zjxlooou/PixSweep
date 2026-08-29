@@ -18,6 +18,7 @@ use crate::ai::topiq::{
     NR_OUTPUT_NAME as TOPIQ_NR_OUTPUT, topiq_iaa_to_score, topiq_nr_to_score,
 };
 use ndarray::Array4;
+use rayon::prelude::*;
 use ort::ep::{CPU, DirectML, ExecutionProvider};
 use ort::session::builder::{GraphOptimizationLevel, SessionBuilder};
 use ort::session::Session;
@@ -102,6 +103,9 @@ pub struct AiEngine {
     hyperiqa_session: Option<parking_lot::Mutex<Session>>,
     /// InsightFace 人脸检测（可选）：存在 buffalo_l 模型时加载
     face_det: Option<crate::ai::insightface::InsightFaceEngine>,
+    /// 最大脸检测共享缓存（路径 → 最大脸）：face/eye/对焦三阶段复用，
+    /// 同一张图全链只跑一次 SCRFD。代理图按路径确定性重建，失效语义与代理缓存一致。
+    detect_cache: parking_lot::Mutex<std::collections::HashMap<String, Option<crate::ai::insightface::Face>>>,
     /// TOPIQ-NR-Face 人脸专评 session（可选）：模型存在时加载
     face_session: Option<parking_lot::Mutex<Session>>,
     /// MobileNetV3 场景分类 session（可选）：模型存在时加载
@@ -287,6 +291,7 @@ impl AiEngine {
             nima_tech_session,
             hyperiqa_session,
             face_det,
+            detect_cache: parking_lot::Mutex::new(std::collections::HashMap::new()),
             face_session,
             scene_session,
             eye_det,
@@ -443,42 +448,29 @@ impl AiEngine {
             return results;
         };
 
-        for (i, path) in paths.iter().enumerate() {
-            // 仅处理 has_faces[i] = true 的图
-            if !has_faces.get(i).copied().unwrap_or(false) {
-                continue;
-            }
-            // 加载代理图（统一前置代理，见 cache::proxy）
-            let img = match crate::cache::proxy::ai_proxy(path) {
-                Ok(img) => img,
-                Err(e) => {
-                    log::warn!("[eye] 加载代理图失败 {}: {}", path, e);
-                    continue;
+        // rayon 并行逐张：单张图的开分只依赖自身像素与模型输出，与处理顺序无关
+        //（collect 保序回填）→ 并行不改变确定性；GPU 会话经 Mutex 串行，CPU 侧的
+        // 代理解码/几何计算与 GPU 重叠，消除整批串行等待（2026-08-29 优化）。
+        let computed: Vec<Option<f32>> =
+            crate::image_io::heavy_pool().install(|| paths
+                .par_iter()
+                .zip(has_faces.par_iter())
+                .map(|(path, &has_face)| {
+                if !has_face {
+                    return None;
                 }
-            };
-            let (w, h) = (img.width(), img.height());
-            let rgb = img.as_raw();
-            // 检测人脸
-            let faces = match face_engine.detect(rgb, h, w) {
-                Ok(f) => f,
-                Err(e) => {
-                    log::warn!("[eye] 人脸检测失败 {}: {}", path, e);
-                    continue;
-                }
-            };
-            if faces.is_empty() {
-                continue;
-            }
-            // 取最大脸
-            let max_face = faces
-                .iter()
-                .max_by(|a, b| {
-                    let area_a = (a.bbox[2] - a.bbox[0]) * (a.bbox[3] - a.bbox[1]);
-                    let area_b = (b.bbox[2] - b.bbox[0]) * (b.bbox[3] - b.bbox[1]);
-                    area_a.partial_cmp(&area_b).unwrap_or(std::cmp::Ordering::Equal)
-                })
-                .copied();
-            if let Some(face) = max_face {
+                // 加载代理图（统一前置代理，见 cache::proxy）
+                let img = match crate::cache::proxy::ai_proxy(path) {
+                    Ok(img) => img,
+                    Err(e) => {
+                        log::warn!("[eye] 加载代理图失败 {}: {}", path, e);
+                        return None;
+                    }
+                };
+                let (w, h) = (img.width(), img.height());
+                let rgb = img.as_raw();
+                // 检测最大脸（共享缓存：人脸专评阶段已检过的图直接复用）
+                let face = self.detect_max_face(face_engine, path, rgb, h, w)?;
                 // 网格为主信号（垂目+眨眼几何都敏感，且提供精确虹膜中心修复 OCEC 采样）。
                 // OCEC 仅作"眨眼否决"：网格判半开以上时其假闭误报较多（如刘海遮挡的睁眼），
                 // 只在网格也模棱两可（< MESH_VETO_BAND）而 OCEC 双眼都强判闭（取 min <
@@ -492,7 +484,7 @@ impl AiEngine {
                 };
                 // 回退分支沿用历史语义 max（任一眼开即开）；否决触发用 min（双眼都闭才否决）
                 let (ocec_any, ocec_both) = ocec.map_or((1.0, 1.0), |(l, r)| (l.max(r), l.min(r)));
-                results[i] = match mesh {
+                Some(match mesh {
                     Some(m) => {
                         if ocec_both < crate::ai::eye::OCEC_VETO_MAX
                             && m.norm_open < crate::ai::eye::MESH_VETO_BAND
@@ -503,7 +495,12 @@ impl AiEngine {
                         }
                     }
                     None => ocec_any,
-                };
+                })
+            })
+            .collect());
+        for (i, v) in computed.into_iter().enumerate() {
+            if let Some(v) = v {
+                results[i] = v;
             }
         }
         results
@@ -532,32 +529,61 @@ impl AiEngine {
         if n == 0 {
             return out;
         }
-        for (i, path) in paths.iter().enumerate() {
-            if has_faces.get(i).copied().unwrap_or(false) {
-                if let Some(v) = self.eye_focus(path) {
-                    out[i] = v;
+        // rayon 并行逐张（同 eye_open_probs：保序回填，确定性不变）
+        let computed: Vec<Option<f32>> =
+            crate::image_io::heavy_pool().install(|| paths
+                .par_iter()
+                .zip(has_faces.par_iter())
+                .map(|(path, &has_face)| {
+                if has_face {
+                    self.eye_focus(path)
+                } else {
+                    crate::cache::proxy::ai_proxy(path)
+                        .ok()
+                        .map(|img| crate::ai::focus::focus_score(&img))
                 }
-            } else if let Ok(img) = crate::cache::proxy::ai_proxy(path) {
-                out[i] = crate::ai::focus::focus_score(&img);
+            })
+            .collect());
+        for (i, v) in computed.into_iter().enumerate() {
+            if let Some(v) = v {
+                out[i] = v;
             }
         }
         out
     }
 
-    /// 单张眼部对焦分（有人脸才调用）：原图检测最大脸 → 采样眼 ROI → 锐度取更清晰者。
+    /// 单张眼部对焦分（有人脸才调用）：检测最大脸（共享缓存）→ 采样眼 ROI → 锐度。
     fn eye_focus(&self, path: &str) -> Option<f32> {
         let det = self.face_det.as_ref()?;
         let img = crate::cache::proxy::ai_proxy(path).ok()?;
         let (w, h) = (img.width(), img.height());
         let raw = img.as_raw();
-        let faces = det.detect(raw, h, w).ok()?;
-        let max_face = faces.iter().copied().max_by(|a, b| {
+        let max_face = self.detect_max_face(det, path, raw, h, w)?;
+        let (lroi, rroi) = crate::ai::eye::debug_sample_eyes_rgb(raw, h, w, &max_face)?;
+        Some(crate::ai::focus::eye_focus_score(&lroi, &rroi))
+    }
+
+    /// 最大脸检测（带共享缓存）：闭眼/对焦阶段优先复用人脸专评阶段的检测结果，
+    /// 避免同一张图重复跑 SCRFD（每张图全链只检测一次）。检测失败不缓存（下次重试）。
+    fn detect_max_face(
+        &self,
+        det: &crate::ai::insightface::InsightFaceEngine,
+        path: &str,
+        rgb: &[u8],
+        h: u32,
+        w: u32,
+    ) -> Option<crate::ai::insightface::Face> {
+        if let Some(hit) = self.detect_cache.lock().get(path) {
+            return *hit;
+        }
+        let faces = det.detect(rgb, h, w).ok()?;
+        let face = faces.into_iter().max_by(|a, b| {
             let area_a = (a.bbox[2] - a.bbox[0]) * (a.bbox[3] - a.bbox[1]);
             let area_b = (b.bbox[2] - b.bbox[0]) * (b.bbox[3] - b.bbox[1]);
             area_a.partial_cmp(&area_b).unwrap_or(std::cmp::Ordering::Equal)
-        })?;
-        let (lroi, rroi) = crate::ai::eye::debug_sample_eyes_rgb(raw, h, w, &max_face)?;
-        Some(crate::ai::focus::eye_focus_score(&lroi, &rroi))
+        });
+        self.detect_cache.lock().insert(path.to_string(), face);
+        face
     }
 
     /// 调试辅助：返回单张图的 MobileNetV3 argmax 类索引。
@@ -657,45 +683,41 @@ impl AiEngine {
             return (scores, has_face);
         };
 
-        // 1) 人脸检测（逐张，因为 align_face 需要原图）
+        // 1) 人脸检测 + 对齐 crop（rayon 并行逐张：同 eye_open_probs，保序回填，
+        // GPU 会话互斥串行，确定性不变）
+        enum Det {
+            NoFace,
+            Crop(Vec<u8>),
+        }
+        let dets: Vec<Det> = crate::image_io::heavy_pool().install(|| paths
+            .par_iter()
+            .map(|path| {
+                // 加载代理图（统一前置代理，见 cache::proxy）
+                let img = match crate::cache::proxy::ai_proxy(path) {
+                    Ok(img) => img,
+                    Err(e) => {
+                        log::warn!("[人脸] 加载失败 {}: {}", path, e);
+                        return Det::NoFace;
+                    }
+                };
+                let (w, h) = (img.width(), img.height());
+                let raw = img.as_raw();
+
+                let max_face = match self.detect_max_face(det, path, raw, h, w) {
+                    Some(f) => f,
+                    None => return Det::NoFace,
+                };
+                Det::Crop(det.align_face(raw, h, w, &max_face, crate::ai::topiq_face::INPUT_SIZE))
+            })
+            .collect());
         let mut crops: Vec<(usize, Vec<u8>, u32)> = Vec::new(); // (idx, crop_rgb, side)
-        for (i, path) in paths.iter().enumerate() {
-            // 加载代理图（统一前置代理，见 cache::proxy）
-            let img = match crate::cache::proxy::ai_proxy(path) {
-                Ok(img) => img,
-                Err(e) => {
-                    log::warn!("[人脸] 加载失败 {}: {}", path, e);
-                    continue;
+        for (i, d) in dets.into_iter().enumerate() {
+            match d {
+                Det::NoFace => {}
+                Det::Crop(crop) => {
+                    has_face[i] = true;
+                    crops.push((i, crop, crate::ai::topiq_face::INPUT_SIZE));
                 }
-            };
-            let (w, h) = (img.width(), img.height());
-            let raw = img.as_raw();
-
-            let faces = match det.detect(raw, h, w) {
-                Ok(f) => f,
-                Err(e) => {
-                    log::warn!("[人脸] 检测失败 {}: {}", path, e);
-                    continue;
-                }
-            };
-            if faces.is_empty() {
-                continue;
-            }
-            has_face[i] = true;
-
-            // 取最大人脸（多人照片聚焦主体）
-            let max_face = faces
-                .iter()
-                .max_by(|a, b| {
-                    let area_a = (a.bbox[2] - a.bbox[0]) * (a.bbox[3] - a.bbox[1]);
-                    let area_b = (b.bbox[2] - b.bbox[0]) * (b.bbox[3] - b.bbox[1]);
-                    area_a.partial_cmp(&area_b).unwrap_or(std::cmp::Ordering::Equal)
-                })
-                .copied();
-
-            if let Some(face) = max_face {
-                let crop = det.align_face(raw, h, w, &face, crate::ai::topiq_face::INPUT_SIZE);
-                crops.push((i, crop, crate::ai::topiq_face::INPUT_SIZE));
             }
         }
 

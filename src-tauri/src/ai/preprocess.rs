@@ -86,10 +86,10 @@ fn images_to_batch_layout(
         Array::<f32, Ix4>::zeros((n, s, s, 3))
     };
 
-    let tensors: anyhow::Result<Vec<_>> = paths
+    let tensors: anyhow::Result<Vec<_>> = crate::image_io::heavy_pool().install(|| paths
         .par_iter()
         .map(|p| image_to_tensor_layout(p, size, chan_first, mean, std))
-        .collect();
+        .collect());
 
     for (i, t) in tensors?.into_iter().enumerate() {
         batch

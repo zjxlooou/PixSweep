@@ -14,6 +14,8 @@ crate-type = ["staticlib", "cdylib", "rlib"]
 tauri-build = { version = "2", features = [] }
 
 [dependencies]
+# 进程内存诊断（扫描各阶段 Private/WS 落日志，定位内存峰值来源）
+windows-sys = { version = "0.59", features = ["Win32_System_ProcessStatus", "Win32_System_Threading"] }
 # ---- Tauri ----
 # custom-protocol：生产模式嵌入前端资源（否则会连接 devUrl localhost）
 tauri = { version = "2", features = ["custom-protocol"] }

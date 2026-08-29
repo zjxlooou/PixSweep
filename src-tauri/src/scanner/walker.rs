@@ -29,6 +29,9 @@ pub fn is_supported_image(path: &Path) -> bool {
 /// 生成文件指纹：基于路径 + 大小 + 修改时间。用于增量扫描判定文件是否变化。
 fn file_fingerprint(path: &Path, size: u64, modified: u64) -> String {
     let mut hasher = blake3::Hasher::new();
+    // v2：哈希算法从"全分辨率原图"改为"统一代理图"（2026-08-29 性能改造），
+    // dhash/ahash 数值随之改变——版本前缀使旧缓存全部失效，一次性重算。
+    hasher.update(b"pixsweep-fp-v2");
     hasher.update(path.to_string_lossy().as_bytes());
     hasher.update(&size.to_le_bytes());
     hasher.update(&modified.to_le_bytes());

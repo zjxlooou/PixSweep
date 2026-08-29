@@ -174,6 +174,37 @@ pub fn build_groups(
                 best_tiebreak = tiebreak;
             }
         }
+        let score_of = |idx: usize| -> f32 {
+            scores
+                .get(idx)
+                .copied()
+                .flatten()
+                .unwrap_or_else(|| heuristic_score(&infos[idx]))
+        };
+        let original_best_idx = best_idx;
+
+        // RAW 原片优先：组内同时有 RAW 与其导出 JPG（同一画面的成对文件很常见）时，
+        // RAW 是无损母版、可重新导出，JPG 只是冗余副本——应保留 RAW。但 RAW 的机内嵌
+        // 预览偏软会让其综合分系统性略低（眼对焦项），故给 0.5 分容差：组内最佳 RAW
+        // 与全局最佳分差在容差内即改推 RAW；分差过大（如组内另一张不同照片明显更好）
+        // 仍尊重评分。
+        const RAW_PREFER_TOLERANCE: f32 = 0.5;
+        if !crate::image_io::is_raw_image(&infos[best_idx].path) {
+            if let Some((raw_idx, raw_score)) = group
+                .iter()
+                .copied()
+                .filter(|&idx| crate::image_io::is_raw_image(&infos[idx].path))
+                .map(|idx| (idx, score_of(idx)))
+                .max_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal))
+            {
+                if raw_score >= best_score - RAW_PREFER_TOLERANCE {
+                    best_idx = raw_idx;
+                    best_score = raw_score;
+                }
+            }
+        }
+        let raw_preferred =
+            best_idx != original_best_idx && crate::image_io::is_raw_image(&infos[best_idx].path);
 
         // 组内评分 + 推荐标记 + 理由
         let best_info = &infos[best_idx];
@@ -198,16 +229,29 @@ pub fn build_groups(
                 let is_out_of_focus = crate::ai::focus::is_out_of_focus(focus_score.unwrap_or(1.0));
                 let recommended = idx == best_idx;
                 let reason = if recommended {
-                    image_reason(
-                        &infos[idx],
-                        score,
-                        aesthetic_score,
-                        technical_score,
-                        face_score,
-                        focus_score,
-                        true,
-                        None,
-                    )
+                    if raw_preferred {
+                        format!(
+                            "RAW 原片，画质最完整且可重新导出（综合 {:.1} 分）",
+                            score.unwrap_or(best_score)
+                        )
+                    } else {
+                        image_reason(
+                            &infos[idx],
+                            score,
+                            aesthetic_score,
+                            technical_score,
+                            face_score,
+                            focus_score,
+                            true,
+                            None,
+                        )
+                    }
+                } else if raw_preferred && !crate::image_io::is_raw_image(&infos[idx].path) {
+                    if idx == original_best_idx {
+                        "同组已保留 RAW 原片（无损母版，可重新导出），本图为冗余 JPG 副本".to_string()
+                    } else {
+                        "同组已保留 RAW 原片，本图内容重复".to_string()
+                    }
                 } else {
                     image_reason(
                         &infos[idx],
@@ -285,6 +329,62 @@ mod tests {
             format: "jpeg".to_string(),
             file_hash: path.to_string(),
         }
+    }
+
+    #[test]
+    fn raw_preferred_over_jpg_pair() {
+        // RAW+JPG 同组：JPG 评分略高（预览软焦使 RAW 系统性略低），仍应保留 RAW
+        let mut jpg = img("DSC_0001.JPG", 12_000_000, 4000, 6000);
+        jpg.format = "jpg".to_string();
+        let mut raw = img("DSC_0001.NEF", 28_000_000, 4000, 6000);
+        raw.format = "nef".to_string();
+        let infos = vec![jpg, raw];
+        let scores = vec![Some(4.33), Some(4.18)]; // JPG 略高
+        let built = build_groups(
+            &infos,
+            &vec![vec![0, 1]],
+            &scores,
+            &vec![None, None],
+            &vec![None, None],
+            &vec![None, None],
+            &vec![false, false],
+            &vec![crate::ai::scene::Scene::Other, crate::ai::scene::Scene::Other],
+            &vec![false, false],
+            &vec![1.0, 1.0],
+            "test",
+        );
+        assert_eq!(built.len(), 1);
+        let rec = built[0].images.iter().find(|g| g.recommended).unwrap();
+        assert_eq!(rec.info.path, "DSC_0001.NEF");
+        assert!(rec.reason.contains("RAW"));
+        let del = built[0].images.iter().find(|g| !g.recommended).unwrap();
+        assert!(del.reason.contains("RAW"));
+    }
+
+    #[test]
+    fn raw_not_preferred_when_far_worse() {
+        // 组内另一张不同照片明显更好（分差 > 容差 0.5）→ 仍按评分推荐
+        let mut jpg_a = img("best.JPG", 12_000_000, 4000, 6000);
+        jpg_a.format = "jpg".to_string();
+        let mut raw_b = img("old.NEF", 28_000_000, 4000, 6000);
+        raw_b.format = "nef".to_string();
+        let infos = vec![jpg_a, raw_b];
+        let scores = vec![Some(7.0), Some(3.0)];
+        let built = build_groups(
+            &infos,
+            &vec![vec![0, 1]],
+            &scores,
+            &vec![None, None],
+            &vec![None, None],
+            &vec![None, None],
+            &vec![false, false],
+            &vec![crate::ai::scene::Scene::Other, crate::ai::scene::Scene::Other],
+            &vec![false, false],
+            &vec![1.0, 1.0],
+            "test",
+        );
+        let rec = built[0].images.iter().find(|g| g.recommended).unwrap();
+        assert_eq!(rec.info.path, "best.JPG");
     }
 
     #[test]

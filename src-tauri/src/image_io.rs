@@ -18,8 +18,59 @@
 //! ```
 
 use std::path::Path;
+use std::sync::{Condvar, Mutex as StdMutex};
 
 use image::{DynamicImage, ImageDecoder, ImageReader};
+
+/// 全局解码并发上限：限制同时驻留内存的全分辨率解码缓冲数量。
+///
+/// 一张 24MP 解码 ≈ 100~200MB、RAW 全显影瞬时可达 GB 级；rayon 无上限并发
+/// （每核一个任务）曾把 350 张的扫描推到 10GB+ 私有内存（2026-08-29 实测）。
+/// 限到 6 路后解码吞吐仍远超 GPU 推理消耗，不影响流水线重叠。
+const MAX_CONCURRENT_DECODE: usize = 6;
+static DECODE_INFLIGHT: StdMutex<usize> = StdMutex::new(0);
+static DECODE_CV: Condvar = Condvar::new();
+
+/// 重活专用线程池：解码/代理生成/检测预处理等大缓冲并行工作固定在
+/// [`MAX_CONCURRENT_DECODE`] 线程内执行，替代 rayon 默认"每逻辑核一线程"的
+/// 全局池——后者 24 路大缓冲并发会把提交内存推到 10GB+（2026-08-29 实测）。
+/// 池内线程数 == 解码许可数，信号量在池内无竞争。
+pub(crate) fn heavy_pool() -> &'static rayon::ThreadPool {
+    static POOL: std::sync::OnceLock<rayon::ThreadPool> = std::sync::OnceLock::new();
+    POOL.get_or_init(|| {
+        rayon::ThreadPoolBuilder::new()
+            .num_threads(MAX_CONCURRENT_DECODE)
+            .thread_name(|i| format!("pixsweep-heavy-{i}"))
+            .build()
+            .expect("创建重活线程池失败")
+    })
+}
+
+/// RAII 解码许可：进入 [`load_image_oriented`] 时获取，离开时释放。
+struct DecodeGuard;
+
+impl DecodeGuard {
+    fn acquire() -> Self {
+        let mut n = DECODE_INFLIGHT
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        while *n >= MAX_CONCURRENT_DECODE {
+            n = DECODE_CV.wait(n).unwrap_or_else(|e| e.into_inner());
+        }
+        *n += 1;
+        DecodeGuard
+    }
+}
+
+impl Drop for DecodeGuard {
+    fn drop(&mut self) {
+        let mut n = DECODE_INFLIGHT
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        *n -= 1;
+        DECODE_CV.notify_one();
+    }
+}
 
 /// 支持的相机 RAW 扩展名（小写）。覆盖主流品牌原生态格式 + DNG 通用容器。
 pub const RAW_EXTENSIONS: &[&str] = &[
@@ -59,6 +110,9 @@ pub fn is_raw_image<P: AsRef<Path>>(path: P) -> bool {
 /// 相机端已完成去马赛克/白平衡/降噪，毫秒级），全无嵌入预览时回退全显影
 /// （demosaic → sRGB，秒级）。两种路径都按 RAW 内 EXIF orientation 旋转。
 pub fn load_image_oriented<P: AsRef<Path>>(path: P) -> anyhow::Result<DynamicImage> {
+    // 并发限流：见 MAX_CONCURRENT_DECODE。缓存命中类调用（如 ai_proxy 命中缓存）
+    // 不经过本函数，不受限。
+    let _guard = DecodeGuard::acquire();
     let path_ref = path.as_ref();
     if is_raw_image(path_ref) {
         return load_raw_oriented(path_ref);
@@ -150,6 +204,36 @@ pub fn raw_source_dimensions(path: &Path) -> Option<(u32, u32)> {
         std::mem::swap(&mut w, &mut h);
     }
     Some((u32::try_from(w).ok()?, u32::try_from(h).ok()?))
+}
+
+/// 仅读文件头获取**转正后**的像素尺寸（不解码像素，毫秒级）。
+///
+/// 非 RAW：`ImageReader::into_dimensions()` 读容器头 + EXIF orientation 判断
+/// 竖拍时宽高互换，结果与全解码口径一致。RAW：直接走 [`raw_source_dimensions`]
+/// 传感器探针。解析失败返回 None，调用方回退全解码尺寸。
+pub fn header_dimensions<P: AsRef<Path>>(path: P) -> Option<(u32, u32)> {
+    let path_ref = path.as_ref();
+    if is_raw_image(path_ref) {
+        return raw_source_dimensions(path_ref);
+    }
+    let (w, h) = ImageReader::open(path_ref)
+        .ok()?
+        .with_guessed_format()
+        .ok()?
+        .into_dimensions()
+        .ok()?;
+    let rotated = matches!(
+        exif_orientation(path_ref).ok()?,
+        image::metadata::Orientation::Rotate90
+            | image::metadata::Orientation::Rotate90FlipH
+            | image::metadata::Orientation::Rotate270
+            | image::metadata::Orientation::Rotate270FlipH
+    );
+    if rotated {
+        Some((h, w))
+    } else {
+        Some((w, h))
+    }
 }
 
 /// RAW 解码：机内嵌预览优先（毫秒级），全无嵌入预览时回退全显影（秒级）。

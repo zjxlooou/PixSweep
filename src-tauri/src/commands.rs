@@ -557,6 +557,7 @@ pub fn run_scan(
         empty_scores(infos.len())
     };
 
+    log_process_mem("scores done (before groups)");
     // 5. 组装结果：生成批次号（yyyyMMddHHmmSS）用于全局唯一组号
     let batch_id = chrono::Local::now().format("%Y%m%d%H%M%S").to_string();
     log::info!("[扫描] 批次号: {}", batch_id);
@@ -712,7 +713,7 @@ fn compute_hashes(
     let counter = AtomicUsize::new(0);
     let last_emitted = parking_lot::Mutex::new(0usize);
 
-    let results: Vec<(u64, u64, u32, u32)> = infos
+    let results: Vec<(u64, u64, u32, u32)> = crate::image_io::heavy_pool().install(|| infos
         .par_iter()
         .zip(cached_records.par_iter())
         .map(|(info, cached)| {
@@ -735,7 +736,7 @@ fn compute_hashes(
             }
             r
         })
-        .collect();
+        .collect());
 
     // 确保最终进度为 100%
     emit(ScanPhase::Hashing, total, total, None, "");
@@ -775,10 +776,42 @@ fn compute_hashes(
 }
 
 /// 从路径解码图片并计算 dhash、ahash 与尺寸。
+/// 记录当前进程内存（工作集/提交）到日志——定位扫描内存峰值的来源阶段。
+#[cfg(windows)]
+fn log_process_mem(tag: &str) {
+    use windows_sys::Win32::System::ProcessStatus::{
+        GetProcessMemoryInfo, PROCESS_MEMORY_COUNTERS_EX,
+    };
+    use windows_sys::Win32::System::Threading::GetCurrentProcess;
+    unsafe {
+        let mut pmc: PROCESS_MEMORY_COUNTERS_EX = std::mem::zeroed();
+        pmc.cb = std::mem::size_of::<PROCESS_MEMORY_COUNTERS_EX>() as u32;
+        if GetProcessMemoryInfo(GetCurrentProcess(), &mut pmc as *mut _ as *mut _, pmc.cb) != 0 {
+            log::info!(
+                "[mem] {}: WS={}MB Commit={}MB",
+                tag,
+                pmc.WorkingSetSize / 1048576,
+                pmc.PrivateUsage / 1048576
+            );
+        }
+    }
+}
+
+#[cfg(not(windows))]
+fn log_process_mem(tag: &str) {
+    let _ = tag;
+}
+
 fn hash_from_path(path: &str) -> Option<(u64, u64, u32, u32)> {
-    use image::GenericImageView;
-    let img = crate::image_io::load_image_oriented(path).ok()?;
-    let (w, h) = img.dimensions();
+    // 哈希从统一代理图计算：全库对每张图只做一次全分辨率解码（即生成代理那一次），
+    // 哈希/评分/人脸/闭眼/对焦全部只读 ≤2K 代理（2026-08-29 性能改造，
+    // 指纹 v2 使旧哈希缓存一次性失效）。dhash/ahash 归一化到 8×9/8×8，
+    // 代理图（<2K）与原图给出的哈希等价。
+    let proxy = crate::cache::proxy::ai_proxy(path).ok()?;
+    let img = image::DynamicImage::ImageRgb8(proxy);
+    // 尺寸用源口径（文件头/传感器探针，不解码像素）：RAW=传感器原生，普通图=转正后全尺寸
+    let (w, h) =
+        crate::image_io::header_dimensions(std::path::Path::new(path)).unwrap_or((img.width(), img.height()));
     Some((
         crate::hashing::phash::dhash(&img),
         crate::hashing::phash::ahash(&img),
@@ -903,6 +936,8 @@ fn score_groups_with_ai(
         let _ = db.save_ai_scores(&infos[idx].file_hash, a, t);
     }
 
+    log_process_mem("hash+cluster done");
+
     // 场景分类（MobileNetV3）：只对需要重算的图片分类，人像由 has_faces 覆盖。逐块推进度。
     if engine.scene_scoring_available() && !need_face.is_empty() {
         const CHUNK: usize = 64;
@@ -944,6 +979,8 @@ fn score_groups_with_ai(
         );
     }
 
+    log_process_mem("scene done");
+
     // 人脸专评：仅对需要重算的图片（增量模式未命中人脸缓存者）做检测 + TOPIQ-NR-Face。
     // 逐块检测并推送进度，避免子阶段内进度条不动。
     if engine.face_scoring_available() && !need_face.is_empty() {
@@ -973,6 +1010,8 @@ fn score_groups_with_ai(
             has_face_total
         );
     }
+
+    log_process_mem("face done");
 
     // 闭眼检测（OCEC）：仅对有脸的图做（人像场景才有意义）。返回 max(open_l, open_r)。
     // 只在检测到的人脸图上逐块推进度。
@@ -1010,6 +1049,8 @@ fn score_groups_with_ai(
         }
     }
 
+    log_process_mem("eye done");
+
     // 对焦分：人像→眼部对焦，非人像→整图对焦。仅对未命中缓存的 need_face 计算，
     // 命中者已从 AiFaceCache 恢复 focus_score。逐块推进度。
     if !need_face.is_empty() {
@@ -1028,6 +1069,8 @@ fn score_groups_with_ai(
         }
     }
 
+    log_process_mem("focus done");
+
     // 非人像美学融合：场景判定完成后，对非人像的新评图用 HyperIQA 与 TOPIQ-IAA
     // 做 50/50 融合——hyperiqa 对风景/宠物/食物的降级敏感度更强（357 张基准
     // Cohen's d=1.20），但人像偏置重，故人像不启用。融合值重写回评分缓存。
@@ -1042,14 +1085,15 @@ fn score_groups_with_ai(
             let fuse_start = std::time::Instant::now();
             emit(ScanPhase::Quality, 0, targets.len(), None, "美学融合");
             let mut done = 0usize;
-            for chunk in targets.chunks(CHUNK) {
-                let cpaths: Vec<String> = chunk.iter().map(|&i| infos[i].path.clone()).collect();
+            // **必须逐张推理**：HyperIQA 是 fix batch=1 导出，批量输入会静默产生
+            // 错误结果，且其密集层中间张量随 batch 线性膨胀——batch=16 单次 run
+            // 实测触碰 3.2GB 主机内存（2026-08-29 内存排查）。
+            for (done, &idx) in targets.iter().enumerate() {
+                let cpaths = vec![infos[idx].path.clone()];
                 match crate::ai::preprocess::images_to_batch_raw01_512(&cpaths) {
                     Ok(batch) => match engine.hyperiqa_scores(&batch) {
                         Ok(hs) => {
-                            for (k, &idx) in chunk.iter().enumerate() {
-                                let Some(h) = hs.get(k).copied() else { continue };
-                                let Some(iaa) = cached_aes[idx] else { continue };
+                            if let (Some(h), Some(iaa)) = (hs.first().copied(), cached_aes[idx]) {
                                 let mapped = crate::ai::engine::HYPERIQA_CAL_A * h
                                     + crate::ai::engine::HYPERIQA_CAL_B;
                                 let fused = (crate::ai::engine::HYPERIQA_FUSION_WEIGHT * iaa
@@ -1062,8 +1106,13 @@ fn score_groups_with_ai(
                     },
                     Err(e) => log::warn!("[AI 评分] HyperIQA 预处理失败: {}", e),
                 }
-                done += chunk.len();
-                emit(ScanPhase::Quality, done, targets.len(), None, "美学融合");
+                emit(
+                    ScanPhase::Quality,
+                    done + 1,
+                    targets.len(),
+                    None,
+                    "美学融合",
+                );
             }
             // 融合后的美学分重写回缓存（save_ai_scores 仅覆盖 Some 字段）
             for &idx in &targets {
@@ -1077,6 +1126,8 @@ fn score_groups_with_ai(
             );
         }
     }
+
+    log_process_mem("hyperiqa done");
 
     // 综合评分：用缓存/推理结果 + 启发式（权重依赖尺寸，与哈希缓存一致）
     let cached_aes_arr = cached_aes;
@@ -1095,6 +1146,7 @@ fn score_groups_with_ai(
         &heights,
         &sizes,
     );
+    log_process_mem("composite done");
     match comp {
         Ok(s) if !s.is_empty() => {
             // 【修复】s 是全长数组（宽度 = infos.len()），须用图片索引 idx 取值，
