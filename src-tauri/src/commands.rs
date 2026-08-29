@@ -744,6 +744,15 @@ fn compute_hashes(
     for (info, (hash, ahash, width, height)) in infos.iter_mut().zip(results.iter()) {
         info.width = *width;
         info.height = *height;
+        // RAW 分辨率用源口径（传感器原生，EXIF 转正）覆盖解码尺寸——机内嵌预览
+        // 往往远小于传感器（如 Sony 1080p 预览 vs 24MP），分辨率启发式会被低估。
+        // 探针不解码像素（毫秒级），对缓存命中路径同样生效，顺带修复旧缓存记录。
+        if crate::image_io::is_raw_image(&info.path) {
+            if let Some((w, h)) = crate::image_io::raw_source_dimensions(std::path::Path::new(&info.path)) {
+                info.width = w;
+                info.height = h;
+            }
+        }
         if *hash != 0 {
             let _ = db.save_image(
                 &info.file_hash,

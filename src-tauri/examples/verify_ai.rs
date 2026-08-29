@@ -65,7 +65,11 @@ fn main() {
             let path = p.to_string_lossy().to_string();
             match image_io::load_image_oriented(&path) {
                 Ok(img) => {
-                    let (w, h) = img.dimensions();
+                    // 与生产扫描同口径：RAW 用传感器原生分辨率（EXIF 转正），
+                    // 解码尺寸仅是机内嵌预览，会低估分辨率启发式
+                    let (w, h) =
+                        pixsweep_lib::image_io::raw_source_dimensions(std::path::Path::new(&path))
+                            .unwrap_or_else(|| img.dimensions());
                     let size = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
                     let name = Path::new(&path)
                         .file_name()

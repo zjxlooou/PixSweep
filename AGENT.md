@@ -104,6 +104,7 @@ cargo run --example verify_scene -- <目录>                   # 场景分类
 - **解码**：rawler 0.7（纯 Rust，dnglab 核心，LGPL-2.1 依赖）。唯一入口在 `image_io::load_image_oriented` 的 RAW 分支——优先机内嵌预览（`full_image` > `preview_image` > `thumbnail_image`，毫秒级，相机端已去马赛克/白平衡），全无嵌入预览才回退全显影（demosaic，实测 RW2 0.4s）。两条路径手动应用 EXIF orientation（官方 `Orientation::from_exif`）。
 - **扩展名清单**：`image_io::RAW_EXTENSIONS` 与 `scanner/walker.rs::SUPPORTED_RAW_EXTENSIONS` 两处保持一致（新增格式要同步改）。23 种：RW2/NEF/NRW/ARW/SRW/CR2/CR3/CRW/RAF/ORF/PEF/PTX/DNG/RAW/RWL/X3F/3FR/ERF/MRW/IIQ/GPR/KDC/DCR。
 - **全链自动生效**：缩略图/AI 评分/代理/哈希/对焦都走 `load_image_oriented`，RAW 无需各自适配。
+- **分辨率源口径**（2026-08-28）：RAW 的宽高在扫描哈希阶段被 `image_io::raw_source_dimensions` 覆盖为传感器原生尺寸（rawler `raw_image(dummy=true)` 探针，毫秒级，crop→active→全幅，EXIF 转正含竖拍宽高互换）——机内嵌预览往往远小于传感器（Sony 1080p 预览 vs 24MP），不覆盖会低估分辨率启发式；缓存命中路径同样覆盖，顺带修复旧缓存记录。验证工具 `examples/raw_dims_check.rs`。
 - 已实测解码：Panasonic RW2（嵌入预览 1920×1440 + 全显影 0.4s）。探针工具：`examples/probe_raw_decode.rs`。
 
 ### 统一前置代理（2026-08-28，`cache/proxy.rs`）
@@ -113,6 +114,7 @@ cargo run --example verify_scene -- <目录>                   # 场景分类
 - **存放**：临时文件夹 `app_data_dir()/quarantine/proxy/`（工具栏"临时文件夹"按钮显示整个隔离区占用，含代理）。旧版程序根 `proxy/` 目录在首次访问时代理模块自动删除。
 - **消费端全统一**：全部 AI 路径（整图评分/场景/人脸检测/闭眼网格+OCEC/眼对焦/nr-on-face crop）都走 `ai_proxy`；**哈希与缩略图除外**（哈希值稳定性、缩略图自有快路径）。
 - **大小对比基准**：代理只参与图像内容分析（指纹/AI/对焦）；一切文件大小比较（综合分启发式、推荐 tie-break、理由文案）用源文件大小 `ImageInfo.size`（walker 阶段 `fs::metadata` 写入）。`ai_proxy` 只返回像素不返回元数据，即结构性保证。
+- **分辨率口径同理**：RAW 的宽高为传感器原生（`raw_source_dimensions` 覆盖），非预览尺寸；代理/解码尺寸只服务内容分析。
 - **精度依据**：对焦整图归一 1024、眼 ROI 归一 24×40 再算拉普拉斯方差，SCRFD letterbox 640×640，闭眼网格用几何比例——对输入分辨率不敏感。闭眼标注集回归 **7/7**（统一前基线 6/7）；RAW 与同画面 JPG 技术分差 ≤0.08、美学 ≤0.02。
 - 验证工具：`examples/proxy_check.rs`（触发判定 + 双断言 + 缓存命中计时）。
 

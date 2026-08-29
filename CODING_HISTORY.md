@@ -275,6 +275,16 @@ Wikimedia Commons 4 类（人像/狗/风景/食物）× 合成降级（blur/jpeg
 - 成对一致性：NEF 技术分差 ≤0.02；RW2 ≤0.08；ARW 技术/美学 ≤0.08。ARW 综合分差 0.5~0.9 来自**既有分辨率启发式**（ARW 内嵌预览 1.7MP vs JPG 24MP），非代理引入。
 - `cargo test` 42/42、`tsc` 0 错、vitest 25/25。
 
+### 2026-08-28（续）— RAW 分辨率源口径
+
+**需求**：评分中的大小/分辨率比较一律用源口径。文件大小审计确认已全走 `ImageInfo.size`（源文件），但 RAW 的宽高来自机内嵌预览解码结果——Sony ARW 预览仅 1.7MP，与同画面 24MP JPG 对比时分辨率启发式被低估（ARW 综合分差 0.5~0.9 的主因）。
+
+**实现**：
+- `image_io::raw_source_dimensions`：rawler `raw_image(dummy=true)` 探针模式（只解析容器与尺寸，不分配不解码像素，实测 1~57ms）；尺寸取 crop_area → active_area → 全幅，按 EXIF 方向转正（竖拍宽高互换），与解码显示口径一致。
+- 扫描哈希写回阶段对 RAW 无条件覆盖 `info.width/height`（缓存命中路径同样生效，顺带修复旧缓存里的预览尺寸）；`verify_ai` 诊断 example 同步。
+
+**验证**：四品牌探针全对（Panasonic 2.6MP 预览→17.1MP、Sony 1.7MP→22.9MP 竖拍 4000×6000 与 JPG 完全一致、Nikon/Canon 本就一致）；ARW 成对综合分差 0.5~0.9 → 0.11~0.20（残余为预览真实清晰度差异）；RW2 成对综合分差 0.5 → ≤0.01；确定性双跑一致；cargo test 42/42。
+
 ---
 
 ## 评分模型演进（重要）

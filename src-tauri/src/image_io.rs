@@ -100,6 +100,58 @@ pub fn exif_orientation<P: AsRef<Path>>(path: P) -> anyhow::Result<image::metada
         .orientation()
         .unwrap_or(image::metadata::Orientation::NoTransforms))
 }
+/// RAW 的传感器原生分辨率（源口径），不解码像素。
+///
+/// 用 rawler `raw_image(dummy=true)` 探针模式：只解析容器与尺寸、不分配不解码
+/// 像素，毫秒级。尺寸优先取 `crop_area`（相机标称有效像素）→ `active_area` →
+/// 全幅读出区。返回**EXIF 方向转正后**的宽高（与显示/解码口径一致）。
+/// 解析失败返回 None，调用方应回退到解码尺寸。
+///
+/// 用途：RAW 的机内嵌预览往往远小于传感器（如 Sony 1080p 预览 vs 24MP 传感器），
+/// 分辨率启发式等**尺寸比较必须用源口径**，否则 RAW 在与同画面 JPG 对比时被
+/// 预览尺寸低估（2026-08-28 用户约定）。
+pub fn raw_source_dimensions(path: &Path) -> Option<(u32, u32)> {
+    use rawler::decoders::RawDecodeParams;
+    use rawler::get_decoder;
+    use rawler::rawsource::RawSource;
+
+    let rawfile = RawSource::new(path).ok()?;
+    let decoder = get_decoder(&rawfile).ok()?;
+    let params = RawDecodeParams::default();
+    let exif_u16 = decoder
+        .raw_metadata(&rawfile, &params)
+        .ok()
+        .and_then(|md| md.exif.orientation);
+    let raw = decoder.raw_image(&rawfile, &params, true).ok()?;
+
+    let (mut w, mut h) = raw
+        .crop_area
+        .or(raw.active_area)
+        .map(|rect| (rect.d.w, rect.d.h))
+        .unwrap_or((raw.width, raw.height));
+    if w == 0 || h == 0 {
+        return None;
+    }
+    // 竖拍（EXIF 旋转 90/270 族）宽高互换，保持与转正后的解码结果同口径
+    let rotated = exif_u16
+        .and_then(|v| u8::try_from(v).ok())
+        .and_then(image::metadata::Orientation::from_exif)
+        .map(|o| {
+            matches!(
+                o,
+                image::metadata::Orientation::Rotate90
+                    | image::metadata::Orientation::Rotate270
+                    | image::metadata::Orientation::Rotate90FlipH
+                    | image::metadata::Orientation::Rotate270FlipH
+            )
+        })
+        .unwrap_or(false);
+    if rotated {
+        std::mem::swap(&mut w, &mut h);
+    }
+    Some((u32::try_from(w).ok()?, u32::try_from(h).ok()?))
+}
+
 /// RAW 解码：机内嵌预览优先（毫秒级），全无嵌入预览时回退全显影（秒级）。
 ///
 /// 两条路径都不自带旋转，统一按 RAW 内 EXIF orientation 手动应用
