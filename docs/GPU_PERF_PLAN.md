@@ -104,7 +104,39 @@
 - **重开条件**：ort 升级到正式版且支持设备侧缓冲写入，或改为单会话串行架构（放弃 M4）。
 - 预期收益本就有限（launch 开销在 scene/eye/hyperIQA 阶段约 1-2s），优先级最低。
 
-### M5 — TensorRT EP（可选大杀器，最后评估）
+### M5 — TensorRT EP（✅ 研究完成 2026-08-29，结论：**暂不上**，理由与重开条件如下）
+
+**支持现状（ort 2.0.0-rc.13）**：
+- `ep::tensorrt` 模块存在，需 cargo feature `tensorrt`（ort-sys/tensorrt）→ ort 会改用
+  **TensorRT 构建的 onnxruntime**（含 onnxruntime_providers_tensorrt.dll）。
+- 但 **TensorRT 运行库本身（nvinfer*.dll 等，数百 MB）不在 ort 下载物里**——需要随包
+  分发或用户安装 TensorRT SDK；当前包仅 DirectML + CUDA 两个 provider DLL。
+
+**预期收益——对小模型场景为负或接近零**：
+- 社区实测：小模型上 TRT EP 反而比 CUDA EP 慢 4×（rust-birdnet-onnx #18）；
+  NVIDIA 论坛亦有 CUDA EP 追平 TRT 的讨论（小模型/动态形状场景 TRT 部分回退）。
+  TRT 的全图融合收益主要在大模型/固定形状高频推理。
+- 我们的模型全是小模型（最大 84.6MB fp16），且 AI 链实测大头已是预处理/代理读取
+  与逐张同步开销，kernel 本身不是瓶颈（face 阶段 GPU util 已能到 30-90%）。
+
+**成本——与本机约束正面冲突**：
+1. **显存 6GB**：TRT 引擎+workspace 独占设备内存，叠加现有会话必顶爆 VRAM
+   （刚修完 VRAM 耗尽减速问题）；
+2. 包体 +300MB~1GB（TRT runtime）；
+3. 每模型每 GPU 首次构建引擎分钟级（trt_engine_cache_enable 可缓存，但驱动升级
+   即失效重建）；
+4. 数值差异风险（YOLOv8 #22354 有先例），需要全部基准重新校准。
+
+**重开条件**：模型规模显著增大（如换 1B+ 级美学模型）；固定形状需求稳定
+（放弃动态 batch）；用户 GPU ≥12GB。满足后再做 1 天 spike：
+feature `tensorrt` + `trt_engine_cache_enable` + `trt_fp16_enable` + 三个主力模型
+基准对比（秩相关 + 墙钟），实测决定。
+
+**当前更优路径**：瓶颈已转移至预处理/代理读取（CPU）与逐张同步——继续收益最大的是
+scene 批量化（MobileNet 图手术与 det_10g 同路线，可行）与 nr_face/det 更大批量，
+均为零新依赖。
+
+### M5 — TensorRT EP（原始占位，见上）（可选大杀器，最后评估）
 
 - 社区报告 ~2× 收益（TRT 全图融合 + fp16 kernel），代价：包体 +~100MB
   TRT DLL、每 GPU 首次构建引擎分钟级（`trt_engine_cache_enable` 可缓存）、
