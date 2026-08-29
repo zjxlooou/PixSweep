@@ -1,6 +1,6 @@
 [package]
 name = "pixsweep"
-version = "0.8.2"
+version = "0.8.3"
 description = "PixSweep - AI-powered duplicate image cleaner for Windows"
 authors = ["PixSweep"]
 edition = "2021"
