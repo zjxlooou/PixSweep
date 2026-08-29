@@ -155,6 +155,12 @@ export interface CacheSummary {
   bytes: number;
 }
 
+/** 临时文件夹（隔离区目录，含 AI 代理图子目录）的磁盘占用。 */
+export interface TempFolderStats {
+  count: number;
+  bytes: number;
+}
+
 /** 缓存清理结果（移入系统回收站）。 */
 export interface CacheCleanupResult {
   moved: number;

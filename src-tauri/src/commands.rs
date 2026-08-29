@@ -2,7 +2,7 @@
 
 use crate::types::{
     AppSettings, CacheCleanupResult, CacheSummary, CacheType, DeleteResult, ImageInfo,
-    McpStatus, ScanPhase, ScanProgress, ScanResult, SystemInfo,
+    McpStatus, ScanPhase, ScanProgress, ScanResult, SystemInfo, TempFolderStats,
 };
 use rayon::prelude::*;
 use std::path::PathBuf;
@@ -1175,6 +1175,28 @@ fn quarantine_files() -> Vec<PathBuf> {
                 .join(&e.quarantine_filename)
         })
         .collect()
+}
+
+/// 临时文件夹（隔离区目录，含 AI 代理图子目录）磁盘占用，进程序时展示在工具栏按钮旁。
+#[tauri::command]
+pub fn get_temp_folder_stats() -> TempFolderStats {
+    let (mut bytes, mut count) = (0u64, 0u32);
+    let mut stack = vec![crate::fileops::trash::quarantine_dir_path()];
+    while let Some(d) = stack.pop() {
+        let Ok(entries) = std::fs::read_dir(&d) else {
+            continue;
+        };
+        for e in entries.flatten() {
+            let p = e.path();
+            if p.is_dir() {
+                stack.push(p);
+            } else if let Ok(m) = e.metadata() {
+                bytes += m.len();
+                count += 1;
+            }
+        }
+    }
+    TempFolderStats { count, bytes }
 }
 
 /// 查询各缓存类型的体积摘要（供前端"清理缓存"面板勾选）。

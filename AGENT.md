@@ -106,6 +106,15 @@ cargo run --example verify_scene -- <目录>                   # 场景分类
 - **全链自动生效**：缩略图/AI 评分/代理/哈希/对焦都走 `load_image_oriented`，RAW 无需各自适配。
 - 已实测解码：Panasonic RW2（嵌入预览 1920×1440 + 全显影 0.4s）。探针工具：`examples/probe_raw_decode.rs`。
 
+### 统一前置代理（2026-08-28，`cache/proxy.rs`）
+
+- **触发**（任一）：最长边 > 2048（2K）｜ 源文件 > 2MiB ｜ RAW 原片。不触发的普通小图直接解码用，不落盘。
+- **输出**：EXIF 转正、最长边 ≤ 1920（<2K）、JPEG 体积 < 2MiB（质量阶梯 95→60，全超限再降到 1280 重试）。缓存版本 v3。
+- **存放**：临时文件夹 `app_data_dir()/quarantine/proxy/`（工具栏"临时文件夹"按钮显示整个隔离区占用，含代理）。旧版程序根 `proxy/` 目录在首次访问时代理模块自动删除。
+- **消费端全统一**：全部 AI 路径（整图评分/场景/人脸检测/闭眼网格+OCEC/眼对焦/nr-on-face crop）都走 `ai_proxy`；**哈希与缩略图除外**（哈希值稳定性、缩略图自有快路径）。
+- **精度依据**：对焦整图归一 1024、眼 ROI 归一 24×40 再算拉普拉斯方差，SCRFD letterbox 640×640，闭眼网格用几何比例——对输入分辨率不敏感。闭眼标注集回归 **7/7**（统一前基线 6/7）；RAW 与同画面 JPG 技术分差 ≤0.08、美学 ≤0.02。
+- 验证工具：`examples/proxy_check.rs`（触发判定 + 双断言 + 缓存命中计时）。
+
 ### 易变签名
 
 `composite_scores`（engine.rs）与 `build_groups`（quality/recommender.rs）签名改动频繁（前者已从纯 slice 演化为 Option 混合）。改前先查定义与全部调用点（`commands.rs`、`examples/verify_*.rs`、测试），改后逐一同步。

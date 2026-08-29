@@ -222,6 +222,7 @@ pub fn run() {
             commands::open_trash_bin_in_explorer,
             commands::get_mcp_status,
             commands::set_mcp_enabled,
+            commands::get_temp_folder_stats,
             commands::get_cache_summary,
             commands::cleanup_cache,
             commands::count_images,

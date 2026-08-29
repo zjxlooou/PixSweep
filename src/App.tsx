@@ -41,6 +41,8 @@ export default function App() {
   const [showSettings, setShowSettings] = useState(false);
   const [showScoreHelp, setShowScoreHelp] = useState(false);
   const [showTrashBin, setShowTrashBin] = useState(false);
+  // 临时文件夹（隔离区 + AI 代理图）磁盘占用，工具栏按钮旁展示
+  const [tempUsage, setTempUsage] = useState<number | null>(null);
   const [pendingDelete, setPendingDelete] = useState<PendingDelete | null>(null);
   const [preview, setPreview] = useState<PreviewState | null>(null);
   const [result, setResult] = useState<ScanResult | null>(null);
@@ -58,12 +60,25 @@ export default function App() {
   const { state: scanState, startScan } = useScan();
   const { state: deleteState, deleteFiles, consumeResult } = useDelete();
 
-  // 加载设置与系统信息
+  const refreshTempUsage = useCallback(() => {
+    api
+      .getTempFolderStats()
+      .then((s) => setTempUsage(s.bytes))
+      .catch(() => setTempUsage(null));
+  }, []);
+
+  // 加载设置与系统信息（进程序时先取一次临时文件夹占用）
   useEffect(() => {
     api.getSettings().then(setSettings).catch(console.error);
     api.getSystemInfo().then(setSystemInfo).catch(console.error);
     api.getMcpStatus().then(setMcpStatus).catch(console.error);
-  }, []);
+    refreshTempUsage();
+  }, [refreshTempUsage]);
+
+  // 扫描结束/临时文件夹操作后刷新占用
+  useEffect(() => {
+    if (!scanState.scanning) refreshTempUsage();
+  }, [scanState.scanning, refreshTempUsage]);
 
   // 同步扫描结果
   useEffect(() => {
@@ -309,7 +324,8 @@ export default function App() {
       }`,
     );
     consumeResult();
-  }, [deleteState.result, showToast, consumeResult]);
+    refreshTempUsage();
+  }, [deleteState.result, showToast, consumeResult, refreshTempUsage]);
 
   // 导出报告
   const handleExportReport = useCallback(async () => {
@@ -344,6 +360,7 @@ export default function App() {
         onOpenTrashBin={() => setShowTrashBin(true)}
         scanning={scanState.scanning}
         aiEnabled={aiEnabled}
+        tempUsage={tempUsage}
       />
 
       {scanState.scanning && scanState.progress && (
@@ -457,6 +474,7 @@ export default function App() {
           onChange={handleSaveSettings}
           onToggleMcp={handleToggleMcp}
           onClose={() => setShowSettings(false)}
+          onAfterCleanup={refreshTempUsage}
         />
       )}
 
@@ -474,7 +492,10 @@ export default function App() {
 
       {showTrashBin && (
         <TrashBinModal
-          onClose={() => setShowTrashBin(false)}
+          onClose={() => {
+            setShowTrashBin(false);
+            refreshTempUsage();
+          }}
           onRestored={(paths) => {
             if (paths.length === 0) return;
             const preview =

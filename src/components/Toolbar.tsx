@@ -1,4 +1,5 @@
 import { open } from "@tauri-apps/plugin-dialog";
+import { formatBytes } from "../types";
 
 interface ToolbarProps {
   folders: string[];
@@ -11,6 +12,8 @@ interface ToolbarProps {
   onOpenTrashBin: () => void;
   scanning: boolean;
   aiEnabled: boolean;
+  /** 临时文件夹磁盘占用（字节）；null = 尚未获取 */
+  tempUsage?: number | null;
 }
 
 export function Toolbar({
@@ -24,6 +27,7 @@ export function Toolbar({
   onOpenTrashBin,
   scanning,
   aiEnabled,
+  tempUsage,
 }: ToolbarProps) {
   const handleAdd = async () => {
     const selected = await open({
@@ -80,8 +84,13 @@ export function Toolbar({
         >
           {scanning ? "扫描中…" : "开始扫描"}
         </button>
-        <button className="btn btn-ghost" onClick={onOpenTrashBin} title="查看临时文件夹并恢复">
+        <button
+          className="btn btn-ghost"
+          onClick={onOpenTrashBin}
+          title="查看临时文件夹并恢复"
+        >
           临时文件夹
+          {tempUsage != null && tempUsage > 0 && ` · ${formatBytes(tempUsage)}`}
         </button>
         <button className="btn btn-ghost" onClick={onOpenScoreHelp} title="查看评分标准说明">
           评分标准

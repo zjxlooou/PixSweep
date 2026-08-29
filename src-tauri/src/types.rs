@@ -208,7 +208,7 @@ pub struct McpStatus {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum CacheType {
-    /// AI 代理图缓存（`app_data_dir()/proxy/`）
+    /// AI 代理图缓存（临时文件夹下 `quarantine/proxy/`）
     Proxy,
     /// 缩略图缓存（`app_data_dir()/thumbnails/`）
     Thumbnails,
@@ -237,4 +237,13 @@ pub struct CacheCleanupResult {
     pub moved: u32,
     /// 失败数量
     pub failed: u32,
+}
+
+/// 临时文件夹（隔离区目录，含 AI 代理图子目录）的磁盘占用。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TempFolderStats {
+    /// 文件总数
+    pub count: u32,
+    /// 总占用字节
+    pub bytes: u64,
 }

@@ -8,6 +8,7 @@ import type {
   McpStatus,
   ScanResult,
   SystemInfo,
+  TempFolderStats,
 } from "./types";
 
 export const api = {
@@ -56,6 +57,8 @@ export const api = {
 
   // 缓存清理（移入系统回收站）
   getCacheSummary: () => invoke<CacheSummary[]>("get_cache_summary"),
+  /** 临时文件夹（含 AI 代理图）磁盘占用，工具栏按钮旁展示 */
+  getTempFolderStats: () => invoke<TempFolderStats>("get_temp_folder_stats"),
   cleanupCache: (types: CacheType[]) =>
     invoke<CacheCleanupResult>("cleanup_cache", { types }),
 

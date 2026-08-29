@@ -448,11 +448,11 @@ impl AiEngine {
             if !has_faces.get(i).copied().unwrap_or(false) {
                 continue;
             }
-            // 加载原图
-            let img = match crate::image_io::load_image_oriented(path) {
-                Ok(img) => img.to_rgb8(),
+            // 加载代理图（统一前置代理，见 cache::proxy）
+            let img = match crate::cache::proxy::ai_proxy(path) {
+                Ok(img) => img,
                 Err(e) => {
-                    log::warn!("[eye] 加载原图失败 {}: {}", path, e);
+                    log::warn!("[eye] 加载代理图失败 {}: {}", path, e);
                     continue;
                 }
             };
@@ -547,10 +547,9 @@ impl AiEngine {
     /// 单张眼部对焦分（有人脸才调用）：原图检测最大脸 → 采样眼 ROI → 锐度取更清晰者。
     fn eye_focus(&self, path: &str) -> Option<f32> {
         let det = self.face_det.as_ref()?;
-        let img = crate::image_io::load_image_oriented(path).ok()?;
+        let img = crate::cache::proxy::ai_proxy(path).ok()?;
         let (w, h) = (img.width(), img.height());
-        let rgb = img.to_rgb8();
-        let raw = rgb.as_raw();
+        let raw = img.as_raw();
         let faces = det.detect(raw, h, w).ok()?;
         let max_face = faces.iter().copied().max_by(|a, b| {
             let area_a = (a.bbox[2] - a.bbox[0]) * (a.bbox[3] - a.bbox[1]);
@@ -574,10 +573,9 @@ impl AiEngine {
     /// 供诊断 example（`verify_landmarks` / `verify_full`）复用。
     pub fn largest_face_landmarks(&self, path: &str) -> Option<([f32; 4], Vec<(f32, f32)>)> {
         let face_engine = self.face_det.as_ref()?;
-        let img = crate::image_io::load_image_oriented(path).ok()?;
+        let img = crate::cache::proxy::ai_proxy(path).ok()?;
         let (w, h) = (img.width(), img.height());
-        let rgb = img.to_rgb8();
-        let raw = rgb.as_raw();
+        let raw = img.as_raw();
         let faces = face_engine.detect(raw, h, w).ok()?;
         let max_face = faces
             .iter()
@@ -604,10 +602,9 @@ impl AiEngine {
         let (Some(face_engine), Some(eye_det)) = (&self.face_det, &self.eye_det) else {
             return None;
         };
-        let img = crate::image_io::load_image_oriented(path).ok()?;
+        let img = crate::cache::proxy::ai_proxy(path).ok()?;
         let (w, h) = (img.width(), img.height());
-        let rgb = img.to_rgb8();
-        let raw = rgb.as_raw();
+        let raw = img.as_raw();
         let faces = face_engine.detect(raw, h, w).ok()?;
         let max_face = faces
             .iter()
@@ -663,8 +660,8 @@ impl AiEngine {
         // 1) 人脸检测（逐张，因为 align_face 需要原图）
         let mut crops: Vec<(usize, Vec<u8>, u32)> = Vec::new(); // (idx, crop_rgb, side)
         for (i, path) in paths.iter().enumerate() {
-            // 加载原图（EXIF 方向校正）
-            let img = match crate::image_io::load_image_oriented(path) {
+            // 加载代理图（统一前置代理，见 cache::proxy）
+            let img = match crate::cache::proxy::ai_proxy(path) {
                 Ok(img) => img,
                 Err(e) => {
                     log::warn!("[人脸] 加载失败 {}: {}", path, e);
@@ -672,8 +669,7 @@ impl AiEngine {
                 }
             };
             let (w, h) = (img.width(), img.height());
-            let rgb = img.to_rgb8();
-            let raw = rgb.as_raw();
+            let raw = img.as_raw();
 
             let faces = match det.detect(raw, h, w) {
                 Ok(f) => f,

@@ -18,6 +18,8 @@ interface SettingsPanelProps {
   onChange: (settings: AppSettings) => void;
   onToggleMcp: (enabled: boolean) => void;
   onClose: () => void;
+  /** 缓存清理完成后回调（App 刷新工具栏临时文件夹占用） */
+  onAfterCleanup?: () => void;
 }
 
 export function SettingsPanel({
@@ -27,6 +29,7 @@ export function SettingsPanel({
   onChange,
   onToggleMcp,
   onClose,
+  onAfterCleanup,
 }: SettingsPanelProps) {
   const update = (patch: Partial<AppSettings>) => {
     onChange({ ...settings, ...patch });
@@ -65,6 +68,7 @@ export function SettingsPanel({
       );
       setCacheSummary(await api.getCacheSummary());
       setSelected(new Set());
+      onAfterCleanup?.();
     } catch (e) {
       setCleanMsg(`清理失败：${String(e)}`);
     } finally {
