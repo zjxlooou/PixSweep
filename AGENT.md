@@ -142,7 +142,9 @@ AI 评分阶段的全量逐图结果统一走 `quality/recommender.rs::AiScoreBu
 
 ## 数据安全
 
-- 本仓库是 git 仓库（远程 `github.com:zjxlooou/PixSweep`）。提交作者为 **ZCode**（邮箱占位 `noreply@zcode.local`），不加 co-author。
+- 本仓库是 git 仓库（远程 `github.com:zjxlooou/PixSweep`，SSH 443）。提交作者为 **ZCode**（邮箱占位 `noreply@zcode.local`），不加 co-author。
+- **push 报 LFS locks 错误**：本仓库不用 LFS，首次 push 若报 `failed to push some refs`（LFS locks/verify EOF，代理环境常见），执行一次 `git config lfs.https://github.com/zjxlooou/PixSweep.git/info/lfs.locksverify false` 即永久解决（已设置）。
+- **发布 release（gh CLI）**：① 先 `gh release create <tag> --notes-file ...`（不带资产），成功后单独 `gh release upload <tag> <zip> --clobber`——`create` 直接带 430MB 资产时上传失败会把整个 release 草稿一并撤掉；② 430MB 资产上传需**绕过本地代理**（`env -u HTTPS_PROXY -u HTTP_PROXY gh release upload ...`），走代理会被中途掐断。
 - ✅ 可安全删除（本地源可重建）：`node_modules/`、`dist/`、`target/`
 - ❌ 不可删（无简单恢复/会破坏构建）：`.tools/`（2.2G 工具链）、`src-tauri/models/`、`dist-package/*.zip`
 - **删除大目录/大量文件前，必须先向用户确认范围。**
