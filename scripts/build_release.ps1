@@ -117,7 +117,7 @@ if (Test-Path $modelDir) {
     # 人像专评/场景/闭眼子目录模型（引擎从 models/<子目录>/ 加载，见 engine.rs）
     # insightface：仅 det_10g（load() 只要求这个；2d106det/genderage 未使用，不打包）
     $subModels = @{
-        "insightface" = @("det_10g.onnx")
+        "insightface" = @("det_10g.onnx")  # det_10g_batched 不随包发布：实测动态 batch 在生产链路无收益且拖慢后续模型（见 docs/GPU_PERF_PLAN.md M1 记录）
         "scene"       = @("mobilenet_v3_large.onnx", "mobilenet_v3_large.data", "labels.txt")
         "eye"         = @("ocec_l.onnx", "face_landmarker.onnx")  # face_landmarker：垂目闭眼脸网格（可选信号，缺则仅 OCEC）
     }

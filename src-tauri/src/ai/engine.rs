@@ -210,7 +210,7 @@ impl AiEngine {
         let insightface_dir = model_dir.join("insightface");
         let face_det = if insightface_dir.join("det_10g.onnx").exists() {
             log::info!("InsightFace 检测模型存在，加载人脸检测: {}", insightface_dir.display());
-            let eng = crate::ai::insightface::InsightFaceEngine::new();
+            let mut eng = crate::ai::insightface::InsightFaceEngine::new();
             match eng.load(&insightface_dir, false) {
                 Ok(()) => {
                     log::info!("InsightFace 人脸检测就绪");
@@ -683,41 +683,73 @@ impl AiEngine {
             return (scores, has_face);
         };
 
-        // 1) 人脸检测 + 对齐 crop（rayon 并行逐张：同 eye_open_probs，保序回填，
-        // GPU 会话互斥串行，确定性不变）
-        enum Det {
-            NoFace,
-            Crop(Vec<u8>),
-        }
-        let dets: Vec<Det> = crate::image_io::heavy_pool().install(|| paths
-            .par_iter()
-            .map(|path| {
-                // 加载代理图（统一前置代理，见 cache::proxy）
-                let img = match crate::cache::proxy::ai_proxy(path) {
-                    Ok(img) => img,
-                    Err(e) => {
-                        log::warn!("[人脸] 加载失败 {}: {}", path, e);
-                        return Det::NoFace;
-                    }
-                };
-                let (w, h) = (img.width(), img.height());
-                let raw = img.as_raw();
-
-                let max_face = match self.detect_max_face(det, path, raw, h, w) {
-                    Some(f) => f,
-                    None => return Det::NoFace,
-                };
-                Det::Crop(det.align_face(raw, h, w, &max_face, crate::ai::topiq_face::INPUT_SIZE))
-            })
-            .collect());
+        // 1) 人脸检测 + 对齐 crop：批量前向（det_10g_batched 动态 batch，8 张一次）
+        //    + 并行 letterbox/对齐。检测结果写入共享缓存（闭眼/眼对焦阶段复用）。
+        //    单图结果只依赖自身，批内顺序固定 -> 确定性不变。
+        const DET_BATCH: usize = 8;
         let mut crops: Vec<(usize, Vec<u8>, u32)> = Vec::new(); // (idx, crop_rgb, side)
-        for (i, d) in dets.into_iter().enumerate() {
-            match d {
-                Det::NoFace => {}
-                Det::Crop(crop) => {
-                    has_face[i] = true;
-                    crops.push((i, crop, crate::ai::topiq_face::INPUT_SIZE));
+        for (base, group) in paths.chunks(DET_BATCH).enumerate() {
+            let base = base * DET_BATCH;
+            // (a) 并行读代理图
+            let imgs: Vec<Option<image::RgbImage>> = crate::image_io::heavy_pool().install(|| {
+                group
+                    .par_iter()
+                    .map(|path| match crate::cache::proxy::ai_proxy(path) {
+                        Ok(img) => Some(img),
+                        Err(e) => {
+                            log::warn!("[人脸] 加载失败 {}: {}", path, e);
+                            None
+                        }
+                    })
+                    .collect()
+            });
+            // (b) 批量检测（跳过加载失败的）
+            let mut ready: Vec<(usize, String, Vec<u8>, u32, u32)> = Vec::new();
+            for (gi, img) in imgs.iter().enumerate() {
+                if let Some(img) = img {
+                    ready.push((
+                        base + gi,
+                        group[gi].clone(),
+                        img.as_raw().to_vec(),
+                        img.width(),
+                        img.height(),
+                    ));
                 }
+            }
+            let refs: Vec<(&[u8], u32, u32)> =
+                ready.iter().map(|(_, _, rgb, w, h)| (rgb.as_slice(), *w, *h)).collect();
+            let results = det.detect_batch(&refs);
+            // (c) 写缓存 + 并行对齐 crop
+            let mut to_align: Vec<(usize, Vec<u8>, u32, u32, crate::ai::insightface::Face)> =
+                Vec::new();
+            for ((idx, path, rgb, w, h), res) in ready.into_iter().zip(results) {
+                match res {
+                    Ok(faces) => {
+                        let max = faces.into_iter().max_by(|a, b| {
+                            let aa = (a.bbox[2] - a.bbox[0]) * (a.bbox[3] - a.bbox[1]);
+                            let bb = (b.bbox[2] - b.bbox[0]) * (b.bbox[3] - b.bbox[1]);
+                            aa.partial_cmp(&bb).unwrap_or(std::cmp::Ordering::Equal)
+                        });
+                        self.detect_cache.lock().insert(path, max);
+                        if let Some(face) = max {
+                            has_face[idx] = true;
+                            to_align.push((idx, rgb, w, h, face));
+                        }
+                    }
+                    Err(e) => log::warn!("[人脸] 批量检测失败: {}", e),
+                }
+            }
+            let aligned: Vec<(usize, Vec<u8>)> = crate::image_io::heavy_pool().install(|| {
+                to_align
+                    .par_iter()
+                    .map(|(idx, rgb, w, h, face)| {
+                        let crop = det.align_face(rgb, *h, *w, face, crate::ai::topiq_face::INPUT_SIZE);
+                        (*idx, crop)
+                    })
+                    .collect()
+            });
+            for (idx, crop) in aligned {
+                crops.push((idx, crop, crate::ai::topiq_face::INPUT_SIZE));
             }
         }
 

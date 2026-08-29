@@ -134,7 +134,7 @@ cargo run --example verify_scene -- <目录>                   # 场景分类
 - **精度**：2026-08-27 起三主力模型为 FP16（IO 保持 FP32，引擎零改动）。实测与 FP32 的 ρ≥0.9998、GPU 更快；**CPU EP 无原生 fp16 核会慢数倍，性能结论只在 GPU 上有效**。
 - **美学融合（可选，hyperiqa.onnx 55MB）**：场景≠人像时 美学=TOPIQ-IAA ⊕ HyperIQA 50/50（线性校准 `HYPERIQA_CAL_*`）。人像偏置重故人像不启用。**必须逐张推理**（fix batch=1）：批量喂入不仅静默出错，其密集层中间张量随 batch 膨胀——batch=16 单次 run 实测触碰 3.2GB 主机内存（2026-08-29 排查定位，曾致扫描内存峰值 14GB）。
 - **人像融合**：face = nr_face ⊕ nr-on-face 50/50（`FACE_FUSION_NR_FACE_WEIGHT`），修 nr_face 的暗光盲区（欠曝人像不再反向加分）；face 缓存 schema v5、评分缓存 v2 联动失效。
-- **batch 维度**：TOPIQ-NR/IAA 为**动态 batch**（整批一次推理）；其余评分模型仍 **fix batch=1**，必须逐张推理（批量输入静默失败）。
+- **batch 维度**：TOPIQ-NR/IAA 为**动态 batch**（整批一次推理）；其余评分模型仍 **fix batch=1**，必须逐张推理（批量输入静默失败）。SCRFD 人脸检测：`det_10g_batched.onnx`（`scripts/make_det_batched.py` 图手术生成，权重不变）存在即启用批量检测，**默认不随包发布**（生产链路实测无净收益且拖慢 HyperIQA，见 GPU_PERF_PLAN.md）；缺失时走 2 副本会话池并行逐张。
 - `models-archive/` 存弃用模型存档（MUSIQ、CLIP 对、FP32 三巨头），不参与打包、不入库。
 - 临时 Python 模型验证脚本用完即删，**不要 `git add` 进提交**。
 

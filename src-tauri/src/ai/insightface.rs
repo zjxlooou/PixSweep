@@ -18,6 +18,7 @@
 //! Rust 工程无 Python 链路，直接加载 .onnx + 手动 NMS。
 
 use anyhow::Context;
+use rayon::prelude::*;
 use ort::ep::DirectML;
 use ort::inputs;
 use ort::session::builder::{GraphOptimizationLevel, SessionBuilder};
@@ -53,10 +54,24 @@ struct Affine {
 
 /// InsightFace 引擎（det_10g 检测 + 5 关键点模板）。
 pub struct InsightFaceEngine {
-    det_session: parking_lot::Mutex<Option<Session>>,
+    /// SCRFD 会话副本池：每个副本各自持有独立 CUDA 流，detect 可真并发——
+    /// 640×640 单张小核填不满 GPU，多流并发把利用率拉起来（det_10g 仅 16MB，
+    /// 4 副本显存可忽略）。轮询分发，阻塞锁（调用方为重活池 6 线程）。
+    det_sessions: Vec<parking_lot::Mutex<Session>>,
+    /// 轮询计数器
+    det_rr: std::sync::atomic::AtomicUsize,
+    /// 批量会话（det_10g_batched，动态 batch）：存在时 detect/detect_batch 全走它
+    batched_session: Option<parking_lot::Mutex<Session>>,
     /// 5 关键点参考模板（112×112 坐标系，来自 InsightFace Python 端约定）。
     template: [(f32, f32); 5],
 }
+
+/// SCRFD 输入边长（letterbox 目标）。
+const DET_SIZE: u32 = 640;
+
+/// 会话副本数。与重活池线程数（6）同量级，GPU 流并发 2 路为宜（4 路会挤压
+/// 显存使后续模型变慢，2026-08-29 实测）。
+const DET_SESSION_REPLICAS: usize = 2;
 
 impl Default for InsightFaceEngine {
     fn default() -> Self {
@@ -76,20 +91,48 @@ impl InsightFaceEngine {
             (71.0, 92.0),
         ];
         Self {
-            det_session: parking_lot::Mutex::new(None),
+            det_sessions: Vec::new(),
+            det_rr: std::sync::atomic::AtomicUsize::new(0),
+            batched_session: None,
             template,
         }
     }
 
     /// 加载模型。`force_cpu=true` 跳过 GPU（与 engine::build_session 一致）。
-    pub fn load(&self, models_dir: &std::path::Path, force_cpu: bool) -> anyhow::Result<()> {
+    pub fn load(&mut self, models_dir: &std::path::Path, force_cpu: bool) -> anyhow::Result<()> {
         let det_path = models_dir.join("det_10g.onnx");
 
         if !det_path.exists() {
             anyhow::bail!("未找到 det_10g.onnx: {}", det_path.display());
         }
 
-        *self.det_session.lock() = Some(Self::build_session(&det_path, force_cpu)?);
+        // 优先批量会话（det_10_batched，一次前向跑 B 张，GPU 利用率最高）
+        let batched_path = models_dir.join("det_10g_batched.onnx");
+        if batched_path.exists() {
+            match Self::build_session(&batched_path, force_cpu) {
+                Ok(sess) => {
+                    self.batched_session = Some(parking_lot::Mutex::new(sess));
+                    log::info!("[InsightFace] 批量会话就绪（动态 batch）");
+                    return Ok(());
+                }
+                Err(e) => log::warn!("[InsightFace] 批量会话构建失败，回退副本池: {e}"),
+            }
+        }
+
+        // 逐个建副本；某个副本失败不影响已有副本（至少保 1 个）
+        for i in 0..DET_SESSION_REPLICAS {
+            match Self::build_session(&det_path, force_cpu) {
+                Ok(sess) => self.det_sessions.push(parking_lot::Mutex::new(sess)),
+                Err(e) => {
+                    if self.det_sessions.is_empty() {
+                        return Err(e);
+                    }
+                    log::warn!("[InsightFace] 副本 {i} 构建失败（继续用已有副本）: {e}");
+                    break;
+                }
+            }
+        }
+        log::info!("[InsightFace] 会话副本 {} 个（并发流）", self.det_sessions.len());
         Ok(())
     }
 
@@ -154,94 +197,131 @@ impl InsightFaceEngine {
 
     /// 检测图像中所有的人脸（det_10g）。
     /// `image` 是 HWC 格式的 RGB u8 数据（h × w × 3）。
+    /// 检测图像中所有的人脸。批量会话可用时走 batch=1 快路径，否则走副本池。
+    /// `image` 是 HWC 格式的 RGB u8 数据（h × w × 3）。
     pub fn detect(&self, image: &[u8], h: u32, w: u32) -> anyhow::Result<Vec<Face>> {
-        let mut session_lock = self.det_session.lock();
-        let session = session_lock.as_mut().ok_or_else(|| anyhow::anyhow!("InsightFace 未加载"))?;
-
-        // letterbox 到 640×640
-        const DET_SIZE: u32 = 640;
-        let scale = (DET_SIZE as f32 / h as f32).min(DET_SIZE as f32 / w as f32);
-        let new_h = (h as f32 * scale).round() as u32;
-        let new_w = (w as f32 * scale).round() as u32;
-        let pad_h = (DET_SIZE - new_h) / 2;
-        let pad_w = (DET_SIZE - new_w) / 2;
-
-        // 简化版预处理（直接调用 image crate 做 letterbox resize）
-        let mut img = image::RgbImage::new(w, h);
-        img.copy_from_slice(image);
-        let resized = image::imageops::resize(&img, new_w, new_h, image::imageops::FilterType::Triangle);
-
-        // blob: 归一化 (img - 127.5) / 128.0，CHW float32
-        let mut blob = ndarray::Array4::<f32>::zeros((1, 3, DET_SIZE as usize, DET_SIZE as usize));
-        for y in 0..DET_SIZE {
-            for x in 0..DET_SIZE {
-                let p = if y >= pad_h && y < pad_h + new_h && x >= pad_w && x < pad_w + new_w {
-                    let sx = (x - pad_w) as u32;
-                    let sy = (y - pad_h) as u32;
-                    if sx < new_w && sy < new_h {
-                        resized.get_pixel(sx, sy).clone()
-                    } else {
-                        image::Rgb([114, 114, 114])
-                    }
-                } else {
-                    // 填充区域用灰色 (114, 114, 114)
-                    image::Rgb([114, 114, 114])
-                };
-                blob[[0, 0, y as usize, x as usize]] = (p[0] as f32 - 127.5) / 128.0;
-                blob[[0, 1, y as usize, x as usize]] = (p[1] as f32 - 127.5) / 128.0;
-                blob[[0, 2, y as usize, x as usize]] = (p[2] as f32 - 127.5) / 128.0;
-            }
+        if self.batched_session.is_some() {
+            let mut out = self.detect_batch(&[(image, h, w)]);
+            return out.remove(0);
         }
-
-        // 【临时诊断】导出 letterbox 输入图，核对人脸位置
-        // (removed - 已确认 letterbox 构造正确，问题在 bbox 解码)
+        if self.det_sessions.is_empty() {
+            anyhow::bail!("InsightFace 未加载");
+        }
+        // 轮询选副本；副本忙则阻塞等（重活池 6 线程 vs 副本数，等待时间短）
+        let idx = if self.det_sessions.len() == 1 {
+            0
+        } else {
+            self.det_rr
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+                % self.det_sessions.len()
+        };
+        let mut session_lock = self.det_sessions[idx].lock();
+        let session = &mut *session_lock;
+        let (blob, scale, pad_h, pad_w) = letterbox_blob(image, h, w);
         let tensor = ort::value::Tensor::from_array(blob).context("det 输入张量失败")?;
-        // 输入名动态获取（det_10g 输入名可能是 "input" 或 "input.1"）
         let input_name = session
             .inputs()
             .first()
             .map(|i| i.name().to_string())
             .unwrap_or_else(|| "input".to_string());
         let outputs = session.run(inputs![input_name.as_str() => tensor]).context("det 推理失败")?;
+        let slices = frame_slices(&outputs, 0)?;
+        Ok(self.decode_frame(&slices, scale, pad_h, pad_w, h, w))
+    }
 
-        // 9 个输出：3 stride × (score, bbox, kps)
-        // 每个 stride 维度: [1, N, 1], [1, N, 4], [1, N, 10]
-        let mut all_boxes: Vec<(f32, [f32; 4], [f32; 10])> = Vec::new(); // (score, bbox, kps)
+    /// 批量人脸检测（det_10g_batched 动态 batch，一次前向跑 B 张）。
+    /// 返回顺序与输入一致。批量会话缺失时逐张回退。
+    pub fn detect_batch(&self, images: &[(&[u8], u32, u32)]) -> Vec<anyhow::Result<Vec<Face>>> {
+        let Some(sess) = &self.batched_session else {
+            // 无批量会话：副本池 + 重活池并行逐张（保持与批量版相同的调用语义）
+            return crate::image_io::heavy_pool().install(|| {
+                images
+                    .par_iter()
+                    .map(|(rgb, w, h)| self.detect(rgb, *h, *w))
+                    .collect()
+            });
+        };
+        let mut session = sess.lock();
+        let result = (|| -> anyhow::Result<Vec<Vec<Face>>> {
+            // letterbox 逐张（CPU resize 便宜），拼 batch
+            let mut batch = ndarray::Array4::<f32>::zeros((
+                images.len(),
+                3,
+                DET_SIZE as usize,
+                DET_SIZE as usize,
+            ));
+            let mut metas = Vec::with_capacity(images.len());
+            for (i, (rgb, w, h)) in images.iter().enumerate() {
+                let (blob, scale, pad_h, pad_w) = letterbox_blob(rgb, *h, *w);
+                batch
+                    .slice_mut(ndarray::s![i, .., .., ..])
+                    .assign(&blob.slice(ndarray::s![0, .., .., ..]));
+                metas.push((scale, pad_h, pad_w, *h, *w));
+            }
+            let tensor = ort::value::Tensor::from_array(batch).context("det 批量输入张量失败")?;
+            let input_name = session
+                .inputs()
+                .first()
+                .map(|i| i.name().to_string())
+                .unwrap_or_else(|| "input".to_string());
+            let outputs = session
+                .run(ort::inputs![input_name.as_str() => tensor])
+                .context("det 批量推理失败")?;
+            let mut all = Vec::with_capacity(images.len());
+            for (b, (scale, pad_h, pad_w, h, w)) in metas.iter().enumerate() {
+                let slices = frame_slices(&outputs, b)?;
+                all.push(self.decode_frame(&slices, *scale, *pad_h, *pad_w, *h, *w));
+            }
+            Ok(all)
+        })();
+        match result {
+            Ok(v) => v.into_iter().map(Ok).collect(),
+            Err(e) => images.iter().map(|_| Err(anyhow::anyhow!("{e}"))).collect(),
+        }
+    }
+
+    /// 解码一帧的 9 输出切片 -> 人脸列表（阈值 0.5 + NMS 0.4 + 坐标反算 + 关键点校验）。
+    fn decode_frame(
+        &self,
+        slices: &FrameSlices,
+        scale: f32,
+        pad_h: u32,
+        pad_w: u32,
+        h: u32,
+        w: u32,
+    ) -> Vec<Face> {
+        let mut all_boxes: Vec<(f32, [f32; 4], [f32; 10])> = Vec::new();
         for (i, stride) in [8u32, 16, 32].iter().enumerate() {
-            let score_arr = outputs[i].try_extract_array::<f32>().context("score 输出解析失败")?;
-            let bbox_arr = outputs[i + 3].try_extract_array::<f32>().context("bbox 输出解析失败")?;
-            let kps_arr = outputs[i + 6].try_extract_array::<f32>().context("kps 输出解析失败")?;
             let h_grid = (DET_SIZE / stride) as usize;
             let w_grid = (DET_SIZE / stride) as usize;
-
             for cy in 0..h_grid {
                 for cx in 0..w_grid {
                     // SCRFD 每个 grid cell 有 2 个 anchor (ratio)
                     for anchor in 0..2 {
-                    let idx = (cy * w_grid + cx) * 2 + anchor;
-                    // 【关键】det_10g 的 score 输出已内嵌 sigmoid（InsightFace Python 端
-                    // 直接与阈值比较，不再做 sigmoid）。二次 sigmoid 会把 0.9 压到 0.71，
-                    // 导致高置信度人脸全部被过滤——这是"检测不到人脸"的根因。
-                    let score = score_arr.as_slice().context("score 切片失败")?[idx];
-                    if score < 0.5 {
-                        continue;
-                    }
-                    // bbox: feature map 位置 + 距离编码（相对 anchor 中心的偏移）
-                    let bb = bbox_arr.as_slice().context("bbox 切片失败")?;
-                    let kps = kps_arr.as_slice().context("kps 切片失败")?;
-                    let cx_pix = (cx as f32 + 0.5) * *stride as f32;
-                    let cy_pix = (cy as f32 + 0.5) * *stride as f32;
-                    let x1 = cx_pix - bb[idx * 4] * *stride as f32;
-                    let y1 = cy_pix - bb[idx * 4 + 1] * *stride as f32;
-                    let x2 = cx_pix + bb[idx * 4 + 2] * *stride as f32;
-                    let y2 = cy_pix + bb[idx * 4 + 3] * *stride as f32;
-                    // 5 关键点（相对 anchor 中心偏移，乘 stride）
-                    let mut landmark = [0.0f32; 10];
-                    for k in 0..5 {
-                        landmark[k * 2] = cx_pix + kps[idx * 10 + k * 2] * *stride as f32;
-                        landmark[k * 2 + 1] = cy_pix + kps[idx * 10 + k * 2 + 1] * *stride as f32;
-                    }
-                    all_boxes.push((score, [x1, y1, x2, y2], landmark));
+                        let idx = (cy * w_grid + cx) * 2 + anchor;
+                        // 【关键】det_10g 的 score 输出已内嵌 sigmoid（InsightFace Python 端
+                        // 直接与阈值比较，不再做 sigmoid）。二次 sigmoid 会把 0.9 压到 0.71，
+                        // 导致高置信度人脸全部被过滤——这是"检测不到人脸"的根因。
+                        let score = slices.scores[i][idx];
+                        if score < 0.5 {
+                            continue;
+                        }
+                        // bbox: feature map 位置 + 距离编码（相对 anchor 中心的偏移）
+                        let bb = &slices.bboxes[i];
+                        let kps = &slices.kpss[i];
+                        let cx_pix = (cx as f32 + 0.5) * *stride as f32;
+                        let cy_pix = (cy as f32 + 0.5) * *stride as f32;
+                        let x1 = cx_pix - bb[idx * 4] * *stride as f32;
+                        let y1 = cy_pix - bb[idx * 4 + 1] * *stride as f32;
+                        let x2 = cx_pix + bb[idx * 4 + 2] * *stride as f32;
+                        let y2 = cy_pix + bb[idx * 4 + 3] * *stride as f32;
+                        // 5 关键点（相对 anchor 中心偏移，乘 stride）
+                        let mut landmark = [0.0f32; 10];
+                        for k in 0..5 {
+                            landmark[k * 2] = cx_pix + kps[idx * 10 + k * 2] * *stride as f32;
+                            landmark[k * 2 + 1] = cy_pix + kps[idx * 10 + k * 2 + 1] * *stride as f32;
+                        }
+                        all_boxes.push((score, [x1, y1, x2, y2], landmark));
                     } // for anchor
                 } // for cx
             } // for cy
@@ -289,11 +369,16 @@ impl InsightFaceEngine {
             // 关键点可信度校验（阶段二）：仅拦明显退化（眼距塌缩 / 关键点大幅背离 bbox），
             // 避免错误的人脸分污染推荐；正常/侧脸/遮挡均可通过。
             if landmarks_trustworthy([x1, y1, x2, y2], &lm) {
-                faces.push(Face { bbox: [x1, y1, x2, y2], score, landmarks: lm });
+                faces.push(Face {
+                    bbox: [x1, y1, x2, y2],
+                    score,
+                    landmarks: lm,
+                });
             }
         }
-        Ok(faces)
+        faces
     }
+
 
     /// 由 5 关键点计算相似仿射参数（InsightFace align_5p 风格，仅平移+缩放+旋转）。
     fn affine_params(&self, face: &Face) -> Affine {
@@ -387,6 +472,81 @@ impl InsightFaceEngine {
         }
         out
     }
+}
+
+/// letterbox 到 640×640 并归一化为 [1,3,640,640] blob（填充区灰色 114）。
+/// 返回 (blob, scale, pad_h, pad_w)。
+fn letterbox_blob(image: &[u8], h: u32, w: u32) -> (ndarray::Array4<f32>, f32, u32, u32) {
+    let scale = (DET_SIZE as f32 / h as f32).min(DET_SIZE as f32 / w as f32);
+    let new_h = (h as f32 * scale).round() as u32;
+    let new_w = (w as f32 * scale).round() as u32;
+    let pad_h = (DET_SIZE - new_h) / 2;
+    let pad_w = (DET_SIZE - new_w) / 2;
+
+    let mut img = image::RgbImage::new(w, h);
+    img.copy_from_slice(image);
+    let resized = image::imageops::resize(&img, new_w, new_h, image::imageops::FilterType::Triangle);
+
+    let mut blob = ndarray::Array4::<f32>::zeros((1, 3, DET_SIZE as usize, DET_SIZE as usize));
+    for y in 0..DET_SIZE {
+        for x in 0..DET_SIZE {
+            let p = if y >= pad_h && y < pad_h + new_h && x >= pad_w && x < pad_w + new_w {
+                let sx = (x - pad_w) as u32;
+                let sy = (y - pad_h) as u32;
+                if sx < new_w && sy < new_h {
+                    resized.get_pixel(sx, sy).clone()
+                } else {
+                    image::Rgb([114, 114, 114])
+                }
+            } else {
+                image::Rgb([114, 114, 114])
+            };
+            blob[[0, 0, y as usize, x as usize]] = (p[0] as f32 - 127.5) / 128.0;
+            blob[[0, 1, y as usize, x as usize]] = (p[1] as f32 - 127.5) / 128.0;
+            blob[[0, 2, y as usize, x as usize]] = (p[2] as f32 - 127.5) / 128.0;
+        }
+    }
+    (blob, scale, pad_h, pad_w)
+}
+
+/// 一帧的 9 输出数据（score/bbox/kps × 3 stride，K = 1/4/10，owned 拷贝约 1MB/帧）。
+struct FrameSlices {
+    scores: [Vec<f32>; 3],
+    bboxes: [Vec<f32>; 3],
+    kpss: [Vec<f32>; 3],
+}
+
+/// 从 9 输出（[B,N,K]）中提取第 b 帧的数据。
+fn frame_slices(
+    outputs: &ort::session::SessionOutputs,
+    b: usize,
+) -> anyhow::Result<FrameSlices> {
+    let mut frame = FrameSlices {
+        scores: [Vec::new(), Vec::new(), Vec::new()],
+        bboxes: [Vec::new(), Vec::new(), Vec::new()],
+        kpss: [Vec::new(), Vec::new(), Vec::new()],
+    };
+    for i in 0..3 {
+        for (dst, out_idx) in [(&mut frame.scores, i), (&mut frame.bboxes, i + 3), (&mut frame.kpss, i + 6)] {
+            let arr = outputs[out_idx].try_extract_array::<f32>()?;
+            let shape = arr.shape();
+            // 原版 det_10g 输出 [N,K]（batch=1 硬编码），批量版 [B,N,K]
+            let (n, k, off) = match shape.len() {
+                2 => (shape[0], shape[1], 0),
+                3 => {
+                    if shape[0] as usize <= b {
+                        anyhow::bail!("det 输出帧 {b} 越界（batch={}）", shape[0]);
+                    }
+                    (shape[1], shape[2], b * shape[1] * shape[2])
+                }
+                _ => anyhow::bail!("det 输出维度异常: {shape:?}"),
+            };
+            let flat = arr.as_slice().context("det 输出非连续")?;
+            anyhow::ensure!(flat.len() >= off + n * k, "det 输出切片越界");
+            dst[i] = flat[off..off + n * k].to_vec();
+        }
+    }
+    Ok(frame)
 }
 
 fn iou(a: &[f32; 4], b: &[f32; 4]) -> f32 {
